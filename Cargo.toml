@@ -1,58 +1,44 @@
 [package]
-name = "rust-pbt"
-version = "0.1.0"
+name = "kitchensink-testing"
+version = "0.2.0"
 edition = "2024"
+rust-version = "1.85"
 authors = ["moofone22@gmail.com"]
 license = "MIT OR Apache-2.0"
-description = "A comprehensive property-based testing framework for Rust with custom strategies, property templates, and reference implementation oracles"
+description = "Kitchen-sink testing framework with reusable generators, laws, mutation orchestration, and serialization helpers"
 repository = "https://github.com/moofone/rust-pbt"
-documentation = "https://docs.rs/rust-pbt"
+documentation = "https://docs.rs/kitchensink-testing"
 readme = "README.md"
-keywords = ["testing", "property-based", "proptest", "mutation-testing", "tdd"]
+keywords = ["testing", "property-based", "proptest", "mutation-testing", "kitchen-sink", "framework"]
 categories = ["development-tools::testing", "development-tools"]
+
+[lib]
+name = "rust_pbt"
+
+[[bin]]
+name = "cargo-pbt"
+path = "src/bin/cargo-pbt.rs"
+required-features = ["mutation"]
 
 [dependencies]
 proptest = "1.5"
-arbitrary = { version = "1.4", optional = true }
-serde = { version = "1.0", features = ["derive"], optional = true }
-serde_json = { version = "1.0", optional = true }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "1.0"
 bincode = { version = "1.3", optional = true }
-chrono = { version = "0.4", optional = true }
+anyhow = { version = "1.0", optional = true }
+clap = { version = "4.5", features = ["derive"], optional = true }
+ctrlc = { version = "3.4", optional = true }
 
 [dev-dependencies]
+tempfile = "3.14"
 
 [features]
-default = ["numeric", "collections", "arithmetic", "stateful"]
-
-# Core feature groups
-numeric = []
-collections = []
-arithmetic = []
-stateful = []
-
-# Optional domain-specific features
-financial = []
-serialization = ["serde", "serde_json", "bincode"]
-temporal = ["chrono"]
-
-# Trading domain strategies (requires temporal)
-trading = ["temporal", "financial"]
-
-# Arbitrary integration
-arbitrary = ["dep:arbitrary"]
-
-# Full feature set
-full = [
-    "numeric",
-    "collections",
-    "arithmetic",
-    "stateful",
-    "financial",
-    "serialization",
-    "temporal",
-    "trading",
-    "arbitrary"
-]
+default = ["core", "serialization", "mutation"]
+core = []
+serialization = ["dep:bincode"]
+mutation = ["dep:anyhow", "dep:clap", "dep:ctrlc"]
+full = ["core", "serialization", "mutation"]
 
 [package.metadata.docs.rs]
 all-features = true

@@ -1,0 +1,745 @@
+//! Mutation run orchestration (new run, resume, status, report).
+
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Instant;
+
+use thiserror::Error;
+
+use super::config::MutationConfig;
+use super::engine::{MutantExecutionResult, MutationEngine, MutationEngineError};
+use super::events::{MutantSpec, MutationEvent, MutationOutcome, now_timestamp_ms};
+use super::report::{ReportFormat, render_report};
+use super::state::{MutationStateError, RunSnapshot, append_event, replay_events};
+
+static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+static RUN_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// Run orchestration errors.
+#[derive(Debug, Error)]
+pub enum MutationRunError {
+    /// State layer error.
+    #[error("state error: {0}")]
+    State(#[from] MutationStateError),
+    /// Engine error.
+    #[error("engine error: {0}")]
+    Engine(#[from] MutationEngineError),
+    /// IO error.
+    #[error("io error: {0}")]
+    Io(#[from] std::io::Error),
+    /// Signal handler error.
+    #[error("signal handler installation failed: {0}")]
+    Signal(String),
+}
+
+/// Result returned by run/resume operations.
+#[derive(Debug, Clone)]
+pub struct RunResult {
+    /// Run id.
+    pub run_id: String,
+    /// Path to run directory.
+    pub run_dir: PathBuf,
+    /// Materialized snapshot after operation.
+    pub snapshot: RunSnapshot,
+}
+
+fn install_signal_handler_once() -> Result<(), MutationRunError> {
+    static INIT: OnceLock<Result<(), String>> = OnceLock::new();
+
+    let result = INIT.get_or_init(|| {
+        ctrlc::set_handler(|| {
+            INTERRUPTED.store(true, Ordering::SeqCst);
+        })
+        .map_err(|e| e.to_string())
+    });
+
+    match result {
+        Ok(()) => Ok(()),
+        Err(msg) => Err(MutationRunError::Signal(msg.clone())),
+    }
+}
+
+fn generate_run_id() -> String {
+    let seq = RUN_SEQUENCE.fetch_add(1, Ordering::SeqCst);
+    format!("run-{}-{}-{}", now_timestamp_ms(), std::process::id(), seq)
+}
+
+fn events_path(run_dir: &Path) -> PathBuf {
+    run_dir.join("events.jsonl")
+}
+
+fn sanitize_mutant_id(mutant_id: &str) -> String {
+    mutant_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn write_mutant_artifacts(
+    run_dir: &Path,
+    mutant_id: &str,
+    result: &MutantExecutionResult,
+) -> Result<(Option<String>, Option<String>), MutationRunError> {
+    let base = run_dir.join("artifacts");
+    std::fs::create_dir_all(&base)?;
+
+    let safe_id = sanitize_mutant_id(mutant_id);
+    let mut stdout_artifact_path = None;
+    let mut stderr_artifact_path = None;
+
+    if !result.stdout.is_empty() || matches!(result.outcome, MutationOutcome::Error { .. }) {
+        let path = base.join(format!("{safe_id}.stdout.log"));
+        std::fs::write(&path, &result.stdout)?;
+        stdout_artifact_path = Some(format!("artifacts/{safe_id}.stdout.log"));
+    }
+
+    if !result.stderr.is_empty() || matches!(result.outcome, MutationOutcome::Error { .. }) {
+        let path = base.join(format!("{safe_id}.stderr.log"));
+        std::fs::write(&path, &result.stderr)?;
+        stderr_artifact_path = Some(format!("artifacts/{safe_id}.stderr.log"));
+    }
+
+    Ok((stdout_artifact_path, stderr_artifact_path))
+}
+
+fn run_mutant(
+    run_id: &str,
+    run_dir: &Path,
+    events: &Path,
+    config: &MutationConfig,
+    engine: &dyn MutationEngine,
+    mutant: &MutantSpec,
+) -> Result<(), MutationRunError> {
+    let started_at_ms = now_timestamp_ms();
+    append_event(
+        events,
+        &MutationEvent::MutantStarted {
+            run_id: run_id.to_string(),
+            timestamp_ms: started_at_ms,
+            mutant_id: mutant.id.clone(),
+        },
+    )?;
+
+    let started = Instant::now();
+    let execution = match engine.execute_mutant(config, mutant) {
+        Ok(execution) => execution,
+        Err(err) => MutantExecutionResult {
+            outcome: MutationOutcome::Error {
+                message: err.to_string(),
+            },
+            exit_code: None,
+            stdout: String::new(),
+            stderr: String::new(),
+        },
+    };
+
+    let finished_at_ms = now_timestamp_ms();
+    let duration_ms = started.elapsed().as_millis() as u64;
+    let (stdout_artifact_path, stderr_artifact_path) =
+        write_mutant_artifacts(run_dir, &mutant.id, &execution)?;
+
+    append_event(
+        events,
+        &MutationEvent::MutantFinished {
+            run_id: run_id.to_string(),
+            timestamp_ms: finished_at_ms,
+            mutant_id: mutant.id.clone(),
+            outcome: execution.outcome,
+            exit_code: execution.exit_code,
+            stdout_artifact_path,
+            stderr_artifact_path,
+            started_at_ms: Some(started_at_ms),
+            finished_at_ms: Some(finished_at_ms),
+            duration_ms: Some(duration_ms),
+        },
+    )?;
+
+    Ok(())
+}
+
+/// Start a new mutation run.
+pub fn run_new(
+    config: &MutationConfig,
+    engine: &dyn MutationEngine,
+) -> Result<RunResult, MutationRunError> {
+    install_signal_handler_once()?;
+    INTERRUPTED.store(false, Ordering::SeqCst);
+
+    let run_id = generate_run_id();
+    let run_dir = config.run_root.join(&run_id);
+    std::fs::create_dir_all(&run_dir)?;
+    let events = events_path(&run_dir);
+
+    let mut mutants = engine.discover_mutants(config)?;
+    if let Some(filter) = &config.filter {
+        mutants.retain(|m| {
+            m.id.contains(filter) || m.label.contains(filter) || m.selector.contains(filter)
+        });
+    }
+
+    append_event(
+        &events,
+        &MutationEvent::RunStarted {
+            run_id: run_id.clone(),
+            timestamp_ms: now_timestamp_ms(),
+            discovered: mutants.len(),
+        },
+    )?;
+
+    for mutant in &mutants {
+        append_event(
+            &events,
+            &MutationEvent::MutantDiscovered {
+                run_id: run_id.clone(),
+                timestamp_ms: now_timestamp_ms(),
+                mutant: mutant.clone(),
+            },
+        )?;
+    }
+
+    for mutant in &mutants {
+        if INTERRUPTED.load(Ordering::SeqCst) {
+            append_event(
+                &events,
+                &MutationEvent::RunInterrupted {
+                    run_id: run_id.clone(),
+                    timestamp_ms: now_timestamp_ms(),
+                    reason: "received interrupt signal".to_string(),
+                },
+            )?;
+            break;
+        }
+        run_mutant(&run_id, &run_dir, &events, config, engine, mutant)?;
+    }
+
+    if !INTERRUPTED.load(Ordering::SeqCst) {
+        append_event(
+            &events,
+            &MutationEvent::RunCompleted {
+                run_id: run_id.clone(),
+                timestamp_ms: now_timestamp_ms(),
+            },
+        )?;
+    }
+
+    let snapshot = replay_events(&events)?;
+    Ok(RunResult {
+        run_id,
+        run_dir,
+        snapshot,
+    })
+}
+
+/// Resume an existing run id.
+pub fn resume_run(
+    config: &MutationConfig,
+    run_id: &str,
+    engine: &dyn MutationEngine,
+) -> Result<RunResult, MutationRunError> {
+    install_signal_handler_once()?;
+    INTERRUPTED.store(false, Ordering::SeqCst);
+
+    let run_dir = config.run_root.join(run_id);
+    let events = events_path(&run_dir);
+    let snapshot = replay_events(&events)?;
+
+    if snapshot.completed {
+        return Ok(RunResult {
+            run_id: run_id.to_string(),
+            run_dir,
+            snapshot,
+        });
+    }
+
+    let pending = snapshot.pending_mutants();
+
+    append_event(
+        &events,
+        &MutationEvent::RunResumed {
+            run_id: run_id.to_string(),
+            timestamp_ms: now_timestamp_ms(),
+            remaining: pending.len(),
+        },
+    )?;
+
+    for mutant in &pending {
+        if INTERRUPTED.load(Ordering::SeqCst) {
+            append_event(
+                &events,
+                &MutationEvent::RunInterrupted {
+                    run_id: run_id.to_string(),
+                    timestamp_ms: now_timestamp_ms(),
+                    reason: "received interrupt signal during resume".to_string(),
+                },
+            )?;
+            break;
+        }
+        run_mutant(run_id, &run_dir, &events, config, engine, mutant)?;
+    }
+
+    if !INTERRUPTED.load(Ordering::SeqCst) {
+        append_event(
+            &events,
+            &MutationEvent::RunCompleted {
+                run_id: run_id.to_string(),
+                timestamp_ms: now_timestamp_ms(),
+            },
+        )?;
+    }
+
+    let snapshot = replay_events(&events)?;
+    Ok(RunResult {
+        run_id: run_id.to_string(),
+        run_dir,
+        snapshot,
+    })
+}
+
+/// Load run status snapshot.
+pub fn load_run_status(
+    config: &MutationConfig,
+    run_id: &str,
+) -> Result<RunSnapshot, MutationRunError> {
+    let events = events_path(&config.run_root.join(run_id));
+    Ok(replay_events(&events)?)
+}
+
+/// Render run report.
+pub fn render_run_report(
+    config: &MutationConfig,
+    run_id: &str,
+    format: ReportFormat,
+) -> Result<String, MutationRunError> {
+    let snapshot = load_run_status(config, run_id)?;
+    Ok(render_report(&snapshot, format))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+    use tempfile::tempdir;
+
+    use super::*;
+
+    fn test_guard() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("runner tests mutex should lock")
+    }
+    use crate::mutation::engine::MutationEngine;
+    use crate::mutation::events::MutantSpec;
+
+    #[derive(Clone)]
+    struct FakeEngine;
+
+    impl MutationEngine for FakeEngine {
+        fn discover_mutants(
+            &self,
+            _config: &MutationConfig,
+        ) -> Result<Vec<MutantSpec>, MutationEngineError> {
+            Ok(vec![
+                MutantSpec {
+                    id: "m1".to_string(),
+                    label: "mutant-1".to_string(),
+                    selector: "sel1".to_string(),
+                },
+                MutantSpec {
+                    id: "m2".to_string(),
+                    label: "mutant-2".to_string(),
+                    selector: "sel2".to_string(),
+                },
+            ])
+        }
+
+        fn execute_mutant(
+            &self,
+            _config: &MutationConfig,
+            mutant: &MutantSpec,
+        ) -> Result<MutantExecutionResult, MutationEngineError> {
+            if mutant.id == "m1" {
+                Ok(MutantExecutionResult {
+                    outcome: MutationOutcome::Killed,
+                    exit_code: None,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                })
+            } else {
+                Ok(MutantExecutionResult {
+                    outcome: MutationOutcome::Survived,
+                    exit_code: None,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                })
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    struct ErrorEngine;
+
+    impl MutationEngine for ErrorEngine {
+        fn discover_mutants(
+            &self,
+            _config: &MutationConfig,
+        ) -> Result<Vec<crate::mutation::events::MutantSpec>, MutationEngineError> {
+            Ok(vec![crate::mutation::events::MutantSpec {
+                id: "m_err".to_string(),
+                label: "mutant-err".to_string(),
+                selector: "sel-err".to_string(),
+            }])
+        }
+
+        fn execute_mutant(
+            &self,
+            _config: &MutationConfig,
+            _mutant: &crate::mutation::events::MutantSpec,
+        ) -> Result<MutantExecutionResult, MutationEngineError> {
+            Err(MutationEngineError::Unsupported("forced error".to_string()))
+        }
+    }
+
+    #[derive(Clone)]
+    struct InterruptingEngine;
+
+    impl MutationEngine for InterruptingEngine {
+        fn discover_mutants(
+            &self,
+            _config: &MutationConfig,
+        ) -> Result<Vec<crate::mutation::events::MutantSpec>, MutationEngineError> {
+            Ok(vec![
+                crate::mutation::events::MutantSpec {
+                    id: "m1".to_string(),
+                    label: "mutant-1".to_string(),
+                    selector: "sel1".to_string(),
+                },
+                crate::mutation::events::MutantSpec {
+                    id: "m2".to_string(),
+                    label: "mutant-2".to_string(),
+                    selector: "sel2".to_string(),
+                },
+            ])
+        }
+
+        fn execute_mutant(
+            &self,
+            _config: &MutationConfig,
+            mutant: &crate::mutation::events::MutantSpec,
+        ) -> Result<MutantExecutionResult, MutationEngineError> {
+            if mutant.id == "m1" {
+                INTERRUPTED.store(true, Ordering::SeqCst);
+            }
+            Ok(MutantExecutionResult {
+                outcome: MutationOutcome::Killed,
+                exit_code: None,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[derive(Clone)]
+    struct SlowEngine;
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    impl MutationEngine for SlowEngine {
+        fn discover_mutants(
+            &self,
+            _config: &MutationConfig,
+        ) -> Result<Vec<crate::mutation::events::MutantSpec>, MutationEngineError> {
+            Ok(vec![
+                crate::mutation::events::MutantSpec {
+                    id: "m1".to_string(),
+                    label: "mutant-1".to_string(),
+                    selector: "sel1".to_string(),
+                },
+                crate::mutation::events::MutantSpec {
+                    id: "m2".to_string(),
+                    label: "mutant-2".to_string(),
+                    selector: "sel2".to_string(),
+                },
+                crate::mutation::events::MutantSpec {
+                    id: "m3".to_string(),
+                    label: "mutant-3".to_string(),
+                    selector: "sel3".to_string(),
+                },
+            ])
+        }
+
+        fn execute_mutant(
+            &self,
+            _config: &MutationConfig,
+            _mutant: &crate::mutation::events::MutantSpec,
+        ) -> Result<MutantExecutionResult, MutationEngineError> {
+            std::thread::sleep(std::time::Duration::from_millis(350));
+            Ok(MutantExecutionResult {
+                outcome: MutationOutcome::Killed,
+                exit_code: None,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        }
+    }
+
+    #[test]
+    fn run_and_resume_roundtrip() {
+        let _guard = test_guard();
+        let tmp = tempdir().expect("tempdir should be created");
+        let config = MutationConfig::default().with_run_root(tmp.path());
+        let engine = FakeEngine;
+
+        let first = run_new(&config, &engine).expect("run should succeed");
+        assert!(first.snapshot.completed);
+
+        let resumed = resume_run(&config, &first.run_id, &engine).expect("resume should succeed");
+        assert!(resumed.snapshot.completed);
+        assert_eq!(resumed.snapshot.pending_mutants().len(), 0);
+    }
+
+    #[test]
+    fn resume_recovers_running_mutant() {
+        let _guard = test_guard();
+        let tmp = tempdir().expect("tempdir should be created");
+        let run_root = tmp.path().join("runs");
+        let run_id = "run-recover";
+        let run_dir = run_root.join(run_id);
+        std::fs::create_dir_all(&run_dir).expect("run dir should be created");
+        let events = run_dir.join("events.jsonl");
+
+        let m1 = MutantSpec {
+            id: "m1".to_string(),
+            label: "mutant-1".to_string(),
+            selector: "sel1".to_string(),
+        };
+        let m2 = MutantSpec {
+            id: "m2".to_string(),
+            label: "mutant-2".to_string(),
+            selector: "sel2".to_string(),
+        };
+
+        append_event(
+            &events,
+            &MutationEvent::RunStarted {
+                run_id: run_id.to_string(),
+                timestamp_ms: now_timestamp_ms(),
+                discovered: 2,
+            },
+        )
+        .expect("run started should append");
+        append_event(
+            &events,
+            &MutationEvent::MutantDiscovered {
+                run_id: run_id.to_string(),
+                timestamp_ms: now_timestamp_ms(),
+                mutant: m1.clone(),
+            },
+        )
+        .expect("m1 discovered should append");
+        append_event(
+            &events,
+            &MutationEvent::MutantDiscovered {
+                run_id: run_id.to_string(),
+                timestamp_ms: now_timestamp_ms(),
+                mutant: m2.clone(),
+            },
+        )
+        .expect("m2 discovered should append");
+        append_event(
+            &events,
+            &MutationEvent::MutantStarted {
+                run_id: run_id.to_string(),
+                timestamp_ms: now_timestamp_ms(),
+                mutant_id: m1.id.clone(),
+            },
+        )
+        .expect("m1 started should append");
+        append_event(
+            &events,
+            &MutationEvent::MutantFinished {
+                run_id: run_id.to_string(),
+                timestamp_ms: now_timestamp_ms(),
+                mutant_id: m1.id.clone(),
+                outcome: MutationOutcome::Killed,
+                exit_code: None,
+                stdout_artifact_path: None,
+                stderr_artifact_path: None,
+                started_at_ms: None,
+                finished_at_ms: None,
+                duration_ms: None,
+            },
+        )
+        .expect("m1 finished should append");
+        append_event(
+            &events,
+            &MutationEvent::MutantStarted {
+                run_id: run_id.to_string(),
+                timestamp_ms: now_timestamp_ms(),
+                mutant_id: m2.id.clone(),
+            },
+        )
+        .expect("m2 started should append");
+
+        let config = MutationConfig::default().with_run_root(run_root);
+        let engine = FakeEngine;
+        let resumed = resume_run(&config, run_id, &engine).expect("resume should succeed");
+
+        let m2_state = resumed
+            .snapshot
+            .mutants
+            .get("m2")
+            .expect("m2 state should exist");
+        assert_eq!(
+            m2_state.status,
+            crate::mutation::state::MutationStatus::Survived
+        );
+        assert!(resumed.snapshot.completed);
+    }
+
+    #[test]
+    fn resume_is_idempotent_after_completion() {
+        let _guard = test_guard();
+        let tmp = tempdir().expect("tempdir should be created");
+        let config = MutationConfig::default().with_run_root(tmp.path());
+        let engine = FakeEngine;
+
+        let first = run_new(&config, &engine).expect("run should succeed");
+        assert!(first.snapshot.completed);
+
+        let second = resume_run(&config, &first.run_id, &engine).expect("first resume should work");
+        let third = resume_run(&config, &first.run_id, &engine).expect("second resume should work");
+
+        assert_eq!(second.snapshot.mutants, third.snapshot.mutants);
+        assert!(third.snapshot.completed);
+        assert_eq!(third.snapshot.pending_mutants().len(), 0);
+    }
+
+    #[test]
+    fn run_records_error_outcome_on_engine_failure() {
+        let _guard = test_guard();
+        let tmp = tempdir().expect("tempdir should be created");
+        let config = MutationConfig::default().with_run_root(tmp.path());
+        let engine = ErrorEngine;
+
+        let run = run_new(&config, &engine).expect("run should still complete");
+        let state = run
+            .snapshot
+            .mutants
+            .get("m_err")
+            .expect("error mutant should be tracked");
+        assert_eq!(state.status, crate::mutation::state::MutationStatus::Error);
+        assert!(
+            state
+                .last_error
+                .as_ref()
+                .is_some_and(|m| m.contains("forced error"))
+        );
+        assert!(run.snapshot.completed);
+    }
+
+    #[test]
+    fn run_records_interruption_without_signal() {
+        let _guard = test_guard();
+        let tmp = tempdir().expect("tempdir should be created");
+        let config = MutationConfig::default().with_run_root(tmp.path());
+        let engine = SlowEngine;
+
+        let interrupter = std::thread::spawn(|| {
+            std::thread::sleep(std::time::Duration::from_millis(120));
+            INTERRUPTED.store(true, Ordering::SeqCst);
+        });
+
+        let run = run_new(&config, &engine).expect("run should stop when interrupted");
+        interrupter
+            .join()
+            .expect("interrupter thread should join cleanly");
+
+        assert!(run.snapshot.interrupted);
+        assert!(!run.snapshot.completed);
+        assert!(
+            !run.snapshot.pending_mutants().is_empty(),
+            "interruption should leave pending mutants"
+        );
+        assert!(
+            run.snapshot.pending_mutants().len() < 3,
+            "at least one mutant should be skipped after interruption"
+        );
+    }
+
+    #[test]
+    fn run_records_interruption_and_leaves_pending_work() {
+        let _guard = test_guard();
+        let tmp = tempdir().expect("tempdir should be created");
+        let config = MutationConfig::default().with_run_root(tmp.path());
+        let engine = InterruptingEngine;
+
+        let run = run_new(&config, &engine).expect("run should succeed");
+        assert!(run.snapshot.interrupted);
+        assert!(!run.snapshot.completed);
+        assert_eq!(run.snapshot.pending_mutants().len(), 1);
+    }
+
+    #[test]
+    fn load_status_for_missing_run_returns_io_error() {
+        let _guard = test_guard();
+        let tmp = tempdir().expect("tempdir should be created");
+        let config = MutationConfig::default().with_run_root(tmp.path());
+
+        let err = load_run_status(&config, "does-not-exist").expect_err("status should fail");
+        match err {
+            MutationRunError::State(MutationStateError::Io(_)) => {}
+            other => panic!("expected IO state error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn render_run_report_reads_persisted_events() {
+        let _guard = test_guard();
+        let tmp = tempdir().expect("tempdir should be created");
+        let config = MutationConfig::default().with_run_root(tmp.path());
+        let engine = FakeEngine;
+
+        let run = run_new(&config, &engine).expect("run should succeed");
+        let md = render_run_report(&config, &run.run_id, ReportFormat::Markdown)
+            .expect("report render should succeed");
+        assert!(md.contains(&run.run_id));
+        assert!(md.contains("| killed |"));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn run_handles_real_sigint_signal() {
+        let _guard = test_guard();
+        let tmp = tempdir().expect("tempdir should be created");
+        let config = MutationConfig::default().with_run_root(tmp.path());
+        let engine = SlowEngine;
+
+        let pid = std::process::id().to_string();
+        let signal_thread = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(120));
+            let _ = std::process::Command::new("kill")
+                .arg("-INT")
+                .arg(pid)
+                .status();
+        });
+
+        let run = run_new(&config, &engine).expect("run should complete with interruption");
+        signal_thread
+            .join()
+            .expect("signal thread should join cleanly");
+
+        assert!(run.snapshot.interrupted);
+        assert!(!run.snapshot.completed);
+        assert!(
+            !run.snapshot.pending_mutants().is_empty(),
+            "at least one mutant should remain pending after SIGINT"
+        );
+    }
+}
