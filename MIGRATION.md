@@ -31,7 +31,8 @@ If you previously used domain helpers (`financial`, `trading`, `options`), defin
 
 New workflow uses resumable run state:
 
-- `cargo kitchensink mutate run` (auto-resumes latest interrupted run for the same project)
+- `cargo kitchensink mutate run` (auto-resumes latest interrupted run; if latest compatible run is complete but has survivors, re-tests survivors first)
 - `cargo kitchensink mutate resume <run-id>`
+- `cargo kitchensink mutate survivors <run-id>` (re-runs only survivors from a specific run)
 - `cargo kitchensink mutate status <run-id>`
 - `cargo kitchensink mutate report <run-id>`

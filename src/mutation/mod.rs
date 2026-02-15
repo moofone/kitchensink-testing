@@ -15,5 +15,5 @@ pub use events::{
     MutationType, RunConfigSnapshot, RunMetadata, TestFailure,
 };
 pub use report::{render_report, MutantReport, ReportFormat, RunSummary};
-pub use runner::{load_run_status, render_run_report, resume_run, run_new, RunResult};
+pub use runner::{load_run_status, render_run_report, rerun_survivors, resume_run, run_new, RunResult};
 pub use state::{MutationStatus, RunInfo, RunSnapshot};

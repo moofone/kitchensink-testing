@@ -113,6 +113,15 @@ impl RunSnapshot {
             .map(|m| m.spec.clone())
             .collect()
     }
+
+    /// Collect survivors for targeted re-test.
+    pub fn survivor_mutants(&self) -> Vec<MutantSpec> {
+        self.mutants
+            .values()
+            .filter(|m| matches!(m.status, MutationStatus::Survived))
+            .map(|m| m.spec.clone())
+            .collect()
+    }
 }
 
 /// State replay errors.

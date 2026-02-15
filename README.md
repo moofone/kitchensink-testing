@@ -45,4 +45,10 @@ cargo-kitchensink mutate run --project .
 
 The direct `cargo-kitchensink ...` form is equivalent; use whichever works in your environment.
 
-`mutate run` now auto-resumes the latest incomplete run for the same `--project`/`--run-root` before starting a fresh run. Use `mutate resume <run-id>` to continue a specific run explicitly.
+`mutate run` now auto-resumes the latest incomplete run for the same `--project`/`--run-root`. If the latest compatible run is already completed but still has survivors, it re-tests those survivors automatically (and on resume, survivors are scheduled before pending mutants). Use `mutate resume <run-id>` to target a specific run explicitly.
+
+To rerun only survivors from a specific run id, use:
+
+```bash
+cargo kitchensink mutate survivors <run-id> --project .
+```

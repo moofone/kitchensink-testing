@@ -1,5 +1,6 @@
 //! Mutation run orchestration (new run, resume, status, report).
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::OnceLock;
@@ -129,6 +130,32 @@ fn parse_run_id_key(run_id: &str) -> Option<RunIdKey> {
     })
 }
 
+fn is_snapshot_compatible(snapshot: &RunSnapshot, config: &MutationConfig) -> bool {
+    let snapshot_filter = snapshot
+        .info
+        .config
+        .as_ref()
+        .and_then(|cfg| cfg.filter.clone());
+    if snapshot_filter != config.filter {
+        return false;
+    }
+
+    let snapshot_timeout = snapshot
+        .info
+        .config
+        .as_ref()
+        .and_then(|cfg| cfg.timeout_secs);
+    snapshot_timeout == config.timeout_secs
+}
+
+fn is_newer_run_id(candidate: &RunIdKey, current: &RunIdKey) -> bool {
+    candidate.timestamp_ms > current.timestamp_ms
+        || (candidate.timestamp_ms == current.timestamp_ms && candidate.pid > current.pid)
+        || (candidate.timestamp_ms == current.timestamp_ms
+            && candidate.pid == current.pid
+            && candidate.sequence > current.sequence)
+}
+
 fn latest_incomplete_run_id(config: &MutationConfig) -> Result<Option<String>, MutationRunError> {
     if !config.run_root.exists() {
         return Ok(None);
@@ -158,32 +185,60 @@ fn latest_incomplete_run_id(config: &MutationConfig) -> Result<Option<String>, M
             continue;
         }
 
-        let snapshot_filter = snapshot
-            .info
-            .config
-            .as_ref()
-            .and_then(|cfg| cfg.filter.clone());
-        if snapshot_filter != config.filter {
-            continue;
-        }
-
-        let snapshot_timeout = snapshot
-            .info
-            .config
-            .as_ref()
-            .and_then(|cfg| cfg.timeout_secs);
-        if snapshot_timeout != config.timeout_secs {
+        if !is_snapshot_compatible(&snapshot, config) {
             continue;
         }
 
         let is_newer = match &newest {
-            Some((current, _)) => {
-                run_id_key.timestamp_ms > current.timestamp_ms
-                    || (run_id_key.timestamp_ms == current.timestamp_ms && run_id_key.pid > current.pid)
-                    || (run_id_key.timestamp_ms == current.timestamp_ms
-                        && run_id_key.pid == current.pid
-                        && run_id_key.sequence > current.sequence)
-            }
+            Some((current, _)) => is_newer_run_id(&run_id_key, current),
+            None => true,
+        };
+
+        if is_newer {
+            newest = Some((run_id_key, run_id));
+        }
+    }
+
+    Ok(newest.map(|(_, run_id)| run_id))
+}
+
+fn latest_completed_run_with_survivors_id(
+    config: &MutationConfig,
+) -> Result<Option<String>, MutationRunError> {
+    if !config.run_root.exists() {
+        return Ok(None);
+    }
+
+    let mut newest: Option<(RunIdKey, String)> = None;
+
+    for entry in std::fs::read_dir(&config.run_root)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+
+        let run_id = entry.file_name().to_string_lossy().to_string();
+        let run_id_key = match parse_run_id_key(&run_id) {
+            Some(key) => key,
+            None => continue,
+        };
+
+        let snapshot = match load_run_status(config, &run_id) {
+            Ok(snapshot) => snapshot,
+            Err(MutationRunError::State(_)) => continue,
+            Err(err) => return Err(err),
+        };
+
+        if !snapshot.completed || snapshot.survivor_mutants().is_empty() {
+            continue;
+        }
+
+        if !is_snapshot_compatible(&snapshot, config) {
+            continue;
+        }
+
+        let is_newer = match &newest {
+            Some((current, _)) => is_newer_run_id(&run_id_key, current),
             None => true,
         };
 
@@ -265,6 +320,11 @@ pub fn run_new(
     if let Some(run_id) = latest_incomplete_run_id(config)? {
         println!("kitchensink-testing: resuming interrupted run {run_id}");
         return resume_run(config, &run_id, engine);
+    }
+
+    if let Some(run_id) = latest_completed_run_with_survivors_id(config)? {
+        println!("kitchensink-testing: retesting survivors from completed run {run_id}");
+        return rerun_survivors(config, &run_id, engine);
     }
 
     let run_id = generate_run_id();
@@ -355,8 +415,10 @@ pub fn resume_run(
     let run_dir = config.run_root.join(run_id);
     let events = events_path(&run_dir);
     let snapshot = replay_events(&events)?;
+    let survivors = snapshot.survivor_mutants();
+    let pending = snapshot.pending_mutants();
 
-    if snapshot.completed {
+    if snapshot.completed && survivors.is_empty() {
         println!("kitchensink-testing: run {run_id} already completed");
         return Ok(RunResult {
             run_id: run_id.to_string(),
@@ -365,23 +427,45 @@ pub fn resume_run(
         });
     }
 
-    let pending = snapshot.pending_mutants();
-    println!(
-        "kitchensink-testing: resuming run {run_id}, {} mutant(s) remaining",
-        pending.len()
-    );
+    if snapshot.completed {
+        println!(
+            "kitchensink-testing: rerunning {} survivor mutant(s) from completed run {run_id}",
+            survivors.len()
+        );
+    } else {
+        println!(
+            "kitchensink-testing: resuming run {run_id}, {} mutant(s) remaining",
+            pending.len()
+        );
+        if !survivors.is_empty() {
+            println!(
+                "kitchensink-testing: retesting {} survivor mutant(s) before pending queue",
+                survivors.len()
+            );
+        }
+    }
+
+    let mut scheduled = survivors;
+    if !snapshot.completed {
+        let mut seen: BTreeSet<String> = scheduled.iter().map(|m| m.id.clone()).collect();
+        for mutant in pending {
+            if seen.insert(mutant.id.clone()) {
+                scheduled.push(mutant);
+            }
+        }
+    }
 
     append_event(
         &events,
         &MutationEvent::RunResumed {
             run_id: run_id.to_string(),
             timestamp_ms: now_timestamp_ms(),
-            remaining: pending.len(),
+            remaining: scheduled.len(),
         },
     )?;
 
-    let total_mutants = pending.len();
-    for (index, mutant) in pending.iter().enumerate() {
+    let total_mutants = scheduled.len();
+    for (index, mutant) in scheduled.iter().enumerate() {
         let position = index + 1;
         println!("kitchensink-testing: running mutant {position}/{total_mutants}: {}", mutant.label);
         if INTERRUPTED.load(Ordering::SeqCst) {
@@ -416,6 +500,72 @@ pub fn resume_run(
     })
 }
 
+/// Re-run only survivors for an existing run id.
+pub fn rerun_survivors(
+    config: &MutationConfig,
+    run_id: &str,
+    engine: &dyn MutationEngine,
+) -> Result<RunResult, MutationRunError> {
+    install_signal_handler_once()?;
+    INTERRUPTED.store(false, Ordering::SeqCst);
+
+    let run_dir = config.run_root.join(run_id);
+    let events = events_path(&run_dir);
+    let snapshot = replay_events(&events)?;
+    let survivors = snapshot.survivor_mutants();
+
+    if survivors.is_empty() {
+        println!("kitchensink-testing: run {run_id} has no survivor mutants to rerun");
+        return Ok(RunResult {
+            run_id: run_id.to_string(),
+            run_dir,
+            snapshot,
+        });
+    }
+
+    println!(
+        "kitchensink-testing: rerunning {} survivor mutant(s) from run {run_id}",
+        survivors.len()
+    );
+
+    append_event(
+        &events,
+        &MutationEvent::RunResumed {
+            run_id: run_id.to_string(),
+            timestamp_ms: now_timestamp_ms(),
+            remaining: survivors.len(),
+        },
+    )?;
+
+    let total_mutants = survivors.len();
+    for (index, mutant) in survivors.iter().enumerate() {
+        let position = index + 1;
+        println!(
+            "kitchensink-testing: running survivor {position}/{total_mutants}: {}",
+            mutant.label
+        );
+        if INTERRUPTED.load(Ordering::SeqCst) {
+            append_event(
+                &events,
+                &MutationEvent::RunInterrupted {
+                    run_id: run_id.to_string(),
+                    timestamp_ms: now_timestamp_ms(),
+                    reason: "received interrupt signal during survivor rerun".to_string(),
+                },
+            )?;
+            break;
+        }
+        run_mutant(run_id, &run_dir, &events, config, engine, mutant)?;
+    }
+
+    let snapshot = replay_events(&events)?;
+    Ok(RunResult {
+        run_id: run_id.to_string(),
+        run_dir,
+        snapshot,
+    })
+}
+
 /// Load run status snapshot.
 pub fn load_run_status(
     config: &MutationConfig,
@@ -437,7 +587,7 @@ pub fn render_run_report(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Mutex, MutexGuard, OnceLock};
+    use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
     use tempfile::tempdir;
 
     use super::*;
@@ -543,6 +693,65 @@ mod tests {
             if mutant.id == "m1" {
                 INTERRUPTED.store(true, Ordering::SeqCst);
             }
+            Ok(MutantExecutionResult {
+                outcome: MutationOutcome::Killed,
+                exit_code: None,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        }
+    }
+
+    #[derive(Clone)]
+    struct AlwaysKilledEngine;
+
+    impl MutationEngine for AlwaysKilledEngine {
+        fn discover_mutants(
+            &self,
+            _config: &MutationConfig,
+        ) -> Result<Vec<MutantSpec>, MutationEngineError> {
+            Ok(vec![
+                test_mutant("m1", "mutant-1", "sel1"),
+                test_mutant("m2", "mutant-2", "sel2"),
+            ])
+        }
+
+        fn execute_mutant(
+            &self,
+            _config: &MutationConfig,
+            _mutant: &MutantSpec,
+        ) -> Result<MutantExecutionResult, MutationEngineError> {
+            Ok(MutantExecutionResult {
+                outcome: MutationOutcome::Killed,
+                exit_code: None,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        }
+    }
+
+    #[derive(Clone)]
+    struct RecordingEngine {
+        order: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl MutationEngine for RecordingEngine {
+        fn discover_mutants(
+            &self,
+            _config: &MutationConfig,
+        ) -> Result<Vec<MutantSpec>, MutationEngineError> {
+            Ok(Vec::new())
+        }
+
+        fn execute_mutant(
+            &self,
+            _config: &MutationConfig,
+            mutant: &MutantSpec,
+        ) -> Result<MutantExecutionResult, MutationEngineError> {
+            self.order
+                .lock()
+                .expect("recording order mutex should lock")
+                .push(mutant.id.clone());
             Ok(MutantExecutionResult {
                 outcome: MutationOutcome::Killed,
                 exit_code: None,
@@ -697,7 +906,7 @@ mod tests {
     }
 
     #[test]
-    fn resume_is_idempotent_after_completion() {
+    fn resume_after_completion_keeps_terminal_outcomes_stable() {
         let _guard = test_guard();
         let tmp = tempdir().expect("tempdir should be created");
         let config = MutationConfig::default().with_run_root(tmp.path());
@@ -709,9 +918,262 @@ mod tests {
         let second = resume_run(&config, &first.run_id, &engine).expect("first resume should work");
         let third = resume_run(&config, &first.run_id, &engine).expect("second resume should work");
 
-        assert_eq!(second.snapshot.mutants, third.snapshot.mutants);
+        let second_m1 = second
+            .snapshot
+            .mutants
+            .get("m1")
+            .expect("m1 state should exist after first resume");
+        let second_m2 = second
+            .snapshot
+            .mutants
+            .get("m2")
+            .expect("m2 state should exist after first resume");
+        let third_m1 = third
+            .snapshot
+            .mutants
+            .get("m1")
+            .expect("m1 state should exist after second resume");
+        let third_m2 = third
+            .snapshot
+            .mutants
+            .get("m2")
+            .expect("m2 state should exist after second resume");
+
+        assert_eq!(
+            second_m1.status,
+            crate::mutation::state::MutationStatus::Killed
+        );
+        assert_eq!(
+            second_m2.status,
+            crate::mutation::state::MutationStatus::Survived
+        );
+        assert_eq!(third_m1.status, second_m1.status);
+        assert_eq!(third_m2.status, second_m2.status);
         assert!(third.snapshot.completed);
         assert_eq!(third.snapshot.pending_mutants().len(), 0);
+    }
+
+    #[test]
+    fn run_new_retests_survivors_from_latest_completed_run() {
+        let _guard = test_guard();
+        let tmp = tempdir().expect("tempdir should be created");
+        let config = MutationConfig::default().with_run_root(tmp.path());
+
+        let first = run_new(&config, &FakeEngine).expect("initial run should succeed");
+        let first_m2 = first
+            .snapshot
+            .mutants
+            .get("m2")
+            .expect("m2 state should exist on first run");
+        assert_eq!(
+            first_m2.status,
+            crate::mutation::state::MutationStatus::Survived
+        );
+
+        let second = run_new(&config, &AlwaysKilledEngine)
+            .expect("second run should retest survivors from the completed run");
+        assert_eq!(
+            second.run_id, first.run_id,
+            "expected run_new to retest survivors in latest completed run"
+        );
+        let second_m2 = second
+            .snapshot
+            .mutants
+            .get("m2")
+            .expect("m2 state should exist on second run");
+        assert_eq!(
+            second_m2.status,
+            crate::mutation::state::MutationStatus::Killed
+        );
+        assert!(second.snapshot.completed);
+    }
+
+    #[test]
+    fn resume_executes_survivors_before_pending_mutants() {
+        let _guard = test_guard();
+        let tmp = tempdir().expect("tempdir should be created");
+        let run_root = tmp.path().join("runs");
+        let run_id = "run-priority";
+        let run_dir = run_root.join(run_id);
+        std::fs::create_dir_all(&run_dir).expect("run dir should be created");
+        let events = run_dir.join("events.jsonl");
+
+        let survivor = test_mutant("m1", "mutant-1", "sel1");
+        let killed = test_mutant("m2", "mutant-2", "sel2");
+        let pending = test_mutant("m3", "mutant-3", "sel3");
+
+        append_event(
+            &events,
+            &MutationEvent::RunStarted {
+                run_id: run_id.to_string(),
+                timestamp_ms: now_timestamp_ms(),
+                discovered: 3,
+                config: None,
+                metadata: None,
+            },
+        )
+        .expect("run started should append");
+        append_event(
+            &events,
+            &MutationEvent::MutantDiscovered {
+                run_id: run_id.to_string(),
+                timestamp_ms: now_timestamp_ms(),
+                mutant: survivor.clone(),
+            },
+        )
+        .expect("survivor discovered should append");
+        append_event(
+            &events,
+            &MutationEvent::MutantDiscovered {
+                run_id: run_id.to_string(),
+                timestamp_ms: now_timestamp_ms(),
+                mutant: killed.clone(),
+            },
+        )
+        .expect("killed discovered should append");
+        append_event(
+            &events,
+            &MutationEvent::MutantDiscovered {
+                run_id: run_id.to_string(),
+                timestamp_ms: now_timestamp_ms(),
+                mutant: pending.clone(),
+            },
+        )
+        .expect("pending discovered should append");
+        append_event(
+            &events,
+            &MutationEvent::MutantFinished {
+                run_id: run_id.to_string(),
+                timestamp_ms: now_timestamp_ms(),
+                mutant_id: survivor.id.clone(),
+                outcome: MutationOutcome::Survived,
+                exit_code: None,
+                stdout_artifact_path: None,
+                stderr_artifact_path: None,
+                started_at_ms: None,
+                finished_at_ms: None,
+                duration_ms: None,
+                tests_run: Vec::new(),
+                tests_failed: Vec::new(),
+                stdout_preview: None,
+                stderr_preview: None,
+            },
+        )
+        .expect("survivor finished should append");
+        append_event(
+            &events,
+            &MutationEvent::MutantFinished {
+                run_id: run_id.to_string(),
+                timestamp_ms: now_timestamp_ms(),
+                mutant_id: killed.id.clone(),
+                outcome: MutationOutcome::Killed,
+                exit_code: None,
+                stdout_artifact_path: None,
+                stderr_artifact_path: None,
+                started_at_ms: None,
+                finished_at_ms: None,
+                duration_ms: None,
+                tests_run: Vec::new(),
+                tests_failed: Vec::new(),
+                stdout_preview: None,
+                stderr_preview: None,
+            },
+        )
+        .expect("killed finished should append");
+
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let config = MutationConfig::default().with_run_root(run_root);
+        let engine = RecordingEngine {
+            order: order.clone(),
+        };
+
+        let resumed = resume_run(&config, run_id, &engine).expect("resume should succeed");
+        let execution_order = order
+            .lock()
+            .expect("recording order mutex should lock")
+            .clone();
+        assert_eq!(execution_order, vec!["m1".to_string(), "m3".to_string()]);
+        assert!(resumed.snapshot.completed);
+    }
+
+    #[test]
+    fn rerun_survivors_executes_only_survivor_queue() {
+        let _guard = test_guard();
+        let tmp = tempdir().expect("tempdir should be created");
+        let run_root = tmp.path().join("runs");
+        let run_id = "run-survivors-only";
+        let run_dir = run_root.join(run_id);
+        std::fs::create_dir_all(&run_dir).expect("run dir should be created");
+        let events = run_dir.join("events.jsonl");
+
+        let survivor = test_mutant("m1", "mutant-1", "sel1");
+        let pending = test_mutant("m2", "mutant-2", "sel2");
+
+        append_event(
+            &events,
+            &MutationEvent::RunStarted {
+                run_id: run_id.to_string(),
+                timestamp_ms: now_timestamp_ms(),
+                discovered: 2,
+                config: None,
+                metadata: None,
+            },
+        )
+        .expect("run started should append");
+        append_event(
+            &events,
+            &MutationEvent::MutantDiscovered {
+                run_id: run_id.to_string(),
+                timestamp_ms: now_timestamp_ms(),
+                mutant: survivor.clone(),
+            },
+        )
+        .expect("survivor discovered should append");
+        append_event(
+            &events,
+            &MutationEvent::MutantDiscovered {
+                run_id: run_id.to_string(),
+                timestamp_ms: now_timestamp_ms(),
+                mutant: pending.clone(),
+            },
+        )
+        .expect("pending discovered should append");
+        append_event(
+            &events,
+            &MutationEvent::MutantFinished {
+                run_id: run_id.to_string(),
+                timestamp_ms: now_timestamp_ms(),
+                mutant_id: survivor.id.clone(),
+                outcome: MutationOutcome::Survived,
+                exit_code: None,
+                stdout_artifact_path: None,
+                stderr_artifact_path: None,
+                started_at_ms: None,
+                finished_at_ms: None,
+                duration_ms: None,
+                tests_run: Vec::new(),
+                tests_failed: Vec::new(),
+                stdout_preview: None,
+                stderr_preview: None,
+            },
+        )
+        .expect("survivor finished should append");
+
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let config = MutationConfig::default().with_run_root(run_root);
+        let engine = RecordingEngine {
+            order: order.clone(),
+        };
+
+        let rerun = rerun_survivors(&config, run_id, &engine).expect("survivor rerun should succeed");
+        let execution_order = order
+            .lock()
+            .expect("recording order mutex should lock")
+            .clone();
+
+        assert_eq!(execution_order, vec!["m1".to_string()]);
+        assert!(!rerun.snapshot.completed);
+        assert_eq!(rerun.snapshot.pending_mutants().len(), 1);
     }
 
     #[test]
