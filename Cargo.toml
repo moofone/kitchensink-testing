@@ -20,6 +20,16 @@ name = "cargo-pbt"
 path = "src/bin/cargo-pbt.rs"
 required-features = ["mutation"]
 
+[[bin]]
+name = "cargo-kitchensink"
+path = "src/bin/cargo-kitchensink.rs"
+required-features = ["mutation"]
+
+[[bin]]
+name = "cargo-kitchensink-testing"
+path = "src/bin/cargo-kitchensink-testing.rs"
+required-features = ["mutation"]
+
 [dependencies]
 proptest = "1.5"
 serde = { version = "1.0", features = ["derive"] }

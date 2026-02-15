@@ -1,17 +1,17 @@
 //! Mutation run orchestration (new run, resume, status, report).
 
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::OnceLock;
 use std::time::Instant;
 
 use thiserror::Error;
 
 use super::config::MutationConfig;
 use super::engine::{MutantExecutionResult, MutationEngine, MutationEngineError};
-use super::events::{MutantSpec, MutationEvent, MutationOutcome, now_timestamp_ms};
-use super::report::{ReportFormat, render_report};
-use super::state::{MutationStateError, RunSnapshot, append_event, replay_events};
+use super::events::{now_timestamp_ms, MutantSpec, MutationEvent, MutationOutcome};
+use super::report::{render_report, ReportFormat};
+use super::state::{append_event, replay_events, MutationStateError, RunSnapshot};
 
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 static RUN_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -109,6 +109,92 @@ fn write_mutant_artifacts(
     Ok((stdout_artifact_path, stderr_artifact_path))
 }
 
+#[derive(Debug, Clone, Copy)]
+struct RunIdKey {
+    timestamp_ms: i64,
+    pid: u32,
+    sequence: u64,
+}
+
+fn parse_run_id_key(run_id: &str) -> Option<RunIdKey> {
+    let mut parts = run_id.split('-');
+    if parts.next()? != "run" {
+        return None;
+    }
+
+    Some(RunIdKey {
+        timestamp_ms: parts.next()?.parse().ok()?,
+        pid: parts.next()?.parse().ok()?,
+        sequence: parts.next()?.parse().ok()?,
+    })
+}
+
+fn latest_incomplete_run_id(config: &MutationConfig) -> Result<Option<String>, MutationRunError> {
+    if !config.run_root.exists() {
+        return Ok(None);
+    }
+
+    let mut newest: Option<(RunIdKey, String)> = None;
+
+    for entry in std::fs::read_dir(&config.run_root)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+
+        let run_id = entry.file_name().to_string_lossy().to_string();
+        let run_id_key = match parse_run_id_key(&run_id) {
+            Some(key) => key,
+            None => continue,
+        };
+
+        let snapshot = match load_run_status(config, &run_id) {
+            Ok(snapshot) => snapshot,
+            Err(MutationRunError::State(_)) => continue,
+            Err(err) => return Err(err),
+        };
+
+        if snapshot.completed || snapshot.pending_mutants().is_empty() {
+            continue;
+        }
+
+        let snapshot_filter = snapshot
+            .info
+            .config
+            .as_ref()
+            .and_then(|cfg| cfg.filter.clone());
+        if snapshot_filter != config.filter {
+            continue;
+        }
+
+        let snapshot_timeout = snapshot
+            .info
+            .config
+            .as_ref()
+            .and_then(|cfg| cfg.timeout_secs);
+        if snapshot_timeout != config.timeout_secs {
+            continue;
+        }
+
+        let is_newer = match &newest {
+            Some((current, _)) => {
+                run_id_key.timestamp_ms > current.timestamp_ms
+                    || (run_id_key.timestamp_ms == current.timestamp_ms && run_id_key.pid > current.pid)
+                    || (run_id_key.timestamp_ms == current.timestamp_ms
+                        && run_id_key.pid == current.pid
+                        && run_id_key.sequence > current.sequence)
+            }
+            None => true,
+        };
+
+        if is_newer {
+            newest = Some((run_id_key, run_id));
+        }
+    }
+
+    Ok(newest.map(|(_, run_id)| run_id))
+}
+
 fn run_mutant(
     run_id: &str,
     run_dir: &Path,
@@ -158,6 +244,10 @@ fn run_mutant(
             started_at_ms: Some(started_at_ms),
             finished_at_ms: Some(finished_at_ms),
             duration_ms: Some(duration_ms),
+            tests_run: Vec::new(),
+            tests_failed: Vec::new(),
+            stdout_preview: Some(super::events::truncate_preview(&execution.stdout)),
+            stderr_preview: Some(super::events::truncate_preview(&execution.stderr)),
         },
     )?;
 
@@ -172,6 +262,11 @@ pub fn run_new(
     install_signal_handler_once()?;
     INTERRUPTED.store(false, Ordering::SeqCst);
 
+    if let Some(run_id) = latest_incomplete_run_id(config)? {
+        println!("kitchensink-testing: resuming interrupted run {run_id}");
+        return resume_run(config, &run_id, engine);
+    }
+
     let run_id = generate_run_id();
     let run_dir = config.run_root.join(&run_id);
     std::fs::create_dir_all(&run_dir)?;
@@ -183,6 +278,7 @@ pub fn run_new(
             m.id.contains(filter) || m.label.contains(filter) || m.selector.contains(filter)
         });
     }
+    println!("kitchensink-testing: discovered {} mutant(s) in {}", mutants.len(), config.project_dir.display());
 
     append_event(
         &events,
@@ -190,9 +286,17 @@ pub fn run_new(
             run_id: run_id.clone(),
             timestamp_ms: now_timestamp_ms(),
             discovered: mutants.len(),
+            config: Some(super::events::RunConfigSnapshot {
+                timeout_secs: config.timeout_secs,
+                filter: config.filter.clone(),
+                quality_gate_minimum_score: None,
+                quality_gate_maximum_survived: None,
+            }),
+            metadata: Some(super::events::collect_metadata()),
         },
     )?;
 
+    let total_mutants = mutants.len();
     for mutant in &mutants {
         append_event(
             &events,
@@ -204,7 +308,9 @@ pub fn run_new(
         )?;
     }
 
-    for mutant in &mutants {
+    for (index, mutant) in mutants.iter().enumerate() {
+        let position = index + 1;
+        println!("kitchensink-testing: running mutant {position}/{total_mutants}: {}", mutant.label);
         if INTERRUPTED.load(Ordering::SeqCst) {
             append_event(
                 &events,
@@ -251,6 +357,7 @@ pub fn resume_run(
     let snapshot = replay_events(&events)?;
 
     if snapshot.completed {
+        println!("kitchensink-testing: run {run_id} already completed");
         return Ok(RunResult {
             run_id: run_id.to_string(),
             run_dir,
@@ -259,6 +366,10 @@ pub fn resume_run(
     }
 
     let pending = snapshot.pending_mutants();
+    println!(
+        "kitchensink-testing: resuming run {run_id}, {} mutant(s) remaining",
+        pending.len()
+    );
 
     append_event(
         &events,
@@ -269,7 +380,10 @@ pub fn resume_run(
         },
     )?;
 
-    for mutant in &pending {
+    let total_mutants = pending.len();
+    for (index, mutant) in pending.iter().enumerate() {
+        let position = index + 1;
+        println!("kitchensink-testing: running mutant {position}/{total_mutants}: {}", mutant.label);
         if INTERRUPTED.load(Ordering::SeqCst) {
             append_event(
                 &events,
@@ -335,7 +449,20 @@ mod tests {
             .expect("runner tests mutex should lock")
     }
     use crate::mutation::engine::MutationEngine;
-    use crate::mutation::events::MutantSpec;
+    use crate::mutation::events::{MutantSpec, MutationType};
+
+    fn test_mutant(id: &str, label: &str, selector: &str) -> MutantSpec {
+        MutantSpec {
+            id: id.to_string(),
+            label: label.to_string(),
+            selector: selector.to_string(),
+            source_file: String::new(),
+            source_line: 0,
+            mutation_type: MutationType::Unknown,
+            original_code: String::new(),
+            mutated_code: String::new(),
+        }
+    }
 
     #[derive(Clone)]
     struct FakeEngine;
@@ -346,16 +473,8 @@ mod tests {
             _config: &MutationConfig,
         ) -> Result<Vec<MutantSpec>, MutationEngineError> {
             Ok(vec![
-                MutantSpec {
-                    id: "m1".to_string(),
-                    label: "mutant-1".to_string(),
-                    selector: "sel1".to_string(),
-                },
-                MutantSpec {
-                    id: "m2".to_string(),
-                    label: "mutant-2".to_string(),
-                    selector: "sel2".to_string(),
-                },
+                test_mutant("m1", "mutant-1", "sel1"),
+                test_mutant("m2", "mutant-2", "sel2"),
             ])
         }
 
@@ -389,18 +508,14 @@ mod tests {
         fn discover_mutants(
             &self,
             _config: &MutationConfig,
-        ) -> Result<Vec<crate::mutation::events::MutantSpec>, MutationEngineError> {
-            Ok(vec![crate::mutation::events::MutantSpec {
-                id: "m_err".to_string(),
-                label: "mutant-err".to_string(),
-                selector: "sel-err".to_string(),
-            }])
+        ) -> Result<Vec<MutantSpec>, MutationEngineError> {
+            Ok(vec![test_mutant("m_err", "mutant-err", "sel-err")])
         }
 
         fn execute_mutant(
             &self,
             _config: &MutationConfig,
-            _mutant: &crate::mutation::events::MutantSpec,
+            _mutant: &MutantSpec,
         ) -> Result<MutantExecutionResult, MutationEngineError> {
             Err(MutationEngineError::Unsupported("forced error".to_string()))
         }
@@ -413,25 +528,17 @@ mod tests {
         fn discover_mutants(
             &self,
             _config: &MutationConfig,
-        ) -> Result<Vec<crate::mutation::events::MutantSpec>, MutationEngineError> {
+        ) -> Result<Vec<MutantSpec>, MutationEngineError> {
             Ok(vec![
-                crate::mutation::events::MutantSpec {
-                    id: "m1".to_string(),
-                    label: "mutant-1".to_string(),
-                    selector: "sel1".to_string(),
-                },
-                crate::mutation::events::MutantSpec {
-                    id: "m2".to_string(),
-                    label: "mutant-2".to_string(),
-                    selector: "sel2".to_string(),
-                },
+                test_mutant("m1", "mutant-1", "sel1"),
+                test_mutant("m2", "mutant-2", "sel2"),
             ])
         }
 
         fn execute_mutant(
             &self,
             _config: &MutationConfig,
-            mutant: &crate::mutation::events::MutantSpec,
+            mutant: &MutantSpec,
         ) -> Result<MutantExecutionResult, MutationEngineError> {
             if mutant.id == "m1" {
                 INTERRUPTED.store(true, Ordering::SeqCst);
@@ -454,32 +561,20 @@ mod tests {
         fn discover_mutants(
             &self,
             _config: &MutationConfig,
-        ) -> Result<Vec<crate::mutation::events::MutantSpec>, MutationEngineError> {
+        ) -> Result<Vec<MutantSpec>, MutationEngineError> {
             Ok(vec![
-                crate::mutation::events::MutantSpec {
-                    id: "m1".to_string(),
-                    label: "mutant-1".to_string(),
-                    selector: "sel1".to_string(),
-                },
-                crate::mutation::events::MutantSpec {
-                    id: "m2".to_string(),
-                    label: "mutant-2".to_string(),
-                    selector: "sel2".to_string(),
-                },
-                crate::mutation::events::MutantSpec {
-                    id: "m3".to_string(),
-                    label: "mutant-3".to_string(),
-                    selector: "sel3".to_string(),
-                },
+                test_mutant("m1", "mutant-1", "sel1"),
+                test_mutant("m2", "mutant-2", "sel2"),
+                test_mutant("m3", "mutant-3", "sel3"),
             ])
         }
 
         fn execute_mutant(
             &self,
             _config: &MutationConfig,
-            _mutant: &crate::mutation::events::MutantSpec,
+            _mutant: &MutantSpec,
         ) -> Result<MutantExecutionResult, MutationEngineError> {
-            std::thread::sleep(std::time::Duration::from_millis(350));
+            std::thread::sleep(std::time::Duration::from_millis(500));
             Ok(MutantExecutionResult {
                 outcome: MutationOutcome::Killed,
                 exit_code: None,
@@ -514,16 +609,8 @@ mod tests {
         std::fs::create_dir_all(&run_dir).expect("run dir should be created");
         let events = run_dir.join("events.jsonl");
 
-        let m1 = MutantSpec {
-            id: "m1".to_string(),
-            label: "mutant-1".to_string(),
-            selector: "sel1".to_string(),
-        };
-        let m2 = MutantSpec {
-            id: "m2".to_string(),
-            label: "mutant-2".to_string(),
-            selector: "sel2".to_string(),
-        };
+        let m1 = test_mutant("m1", "mutant-1", "sel1");
+        let m2 = test_mutant("m2", "mutant-2", "sel2");
 
         append_event(
             &events,
@@ -531,6 +618,8 @@ mod tests {
                 run_id: run_id.to_string(),
                 timestamp_ms: now_timestamp_ms(),
                 discovered: 2,
+                config: None,
+                metadata: None,
             },
         )
         .expect("run started should append");
@@ -574,6 +663,10 @@ mod tests {
                 started_at_ms: None,
                 finished_at_ms: None,
                 duration_ms: None,
+                tests_run: Vec::new(),
+                tests_failed: Vec::new(),
+                stdout_preview: None,
+                stderr_preview: None,
             },
         )
         .expect("m1 finished should append");
@@ -635,12 +728,10 @@ mod tests {
             .get("m_err")
             .expect("error mutant should be tracked");
         assert_eq!(state.status, crate::mutation::state::MutationStatus::Error);
-        assert!(
-            state
-                .last_error
-                .as_ref()
-                .is_some_and(|m| m.contains("forced error"))
-        );
+        assert!(state
+            .last_error
+            .as_ref()
+            .is_some_and(|m| m.contains("forced error")));
         assert!(run.snapshot.completed);
     }
 
@@ -652,7 +743,7 @@ mod tests {
         let engine = SlowEngine;
 
         let interrupter = std::thread::spawn(|| {
-            std::thread::sleep(std::time::Duration::from_millis(120));
+            std::thread::sleep(std::time::Duration::from_millis(200));
             INTERRUPTED.store(true, Ordering::SeqCst);
         });
 
@@ -684,6 +775,24 @@ mod tests {
         assert!(run.snapshot.interrupted);
         assert!(!run.snapshot.completed);
         assert_eq!(run.snapshot.pending_mutants().len(), 1);
+    }
+
+    #[test]
+    fn run_new_resumes_latest_incomplete_run() {
+        let _guard = test_guard();
+        let tmp = tempdir().expect("tempdir should be created");
+        let config = MutationConfig::default().with_run_root(tmp.path());
+
+        let interrupted = run_new(&config, &InterruptingEngine)
+            .expect("run should capture interruption and leave pending mutants");
+        assert!(interrupted.snapshot.interrupted);
+        assert!(!interrupted.snapshot.completed);
+        assert!(!interrupted.snapshot.pending_mutants().is_empty());
+
+        let resumed = run_new(&config, &FakeEngine).expect("rerun should resume interrupted run");
+        assert_eq!(resumed.run_id, interrupted.run_id);
+        assert!(resumed.snapshot.completed);
+        assert_eq!(resumed.snapshot.pending_mutants().len(), 0);
     }
 
     #[test]
@@ -723,7 +832,7 @@ mod tests {
 
         let pid = std::process::id().to_string();
         let signal_thread = std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(120));
+            std::thread::sleep(std::time::Duration::from_millis(200));
             let _ = std::process::Command::new("kill")
                 .arg("-INT")
                 .arg(pid)

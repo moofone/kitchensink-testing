@@ -14,7 +14,8 @@ Reusable testing infrastructure for high-assurance Rust. This crate unifies Prop
 | **Invariant Laws** | Verify logic bounds (monotonicity, range, approximations)              | ✅ Available |
 | **Stateful Laws**  | Verify state machines (transitions, idempotence, sequence validity)    | ✅ Available |
 | **Serialization**  | Guarantee JSON/Bincode roundtrip stability and determinism             | ✅ Available |
-| **Mutation**       | Orchestrate `cargo pbt` mutation runs to find gaps in test logic       | ✅ Available |
+| **Chaos / Retry**  | Validate transient retry, permanent failures, and fallback behavior      | ✅ Available |
+| **Mutation**       | Orchestrate `cargo kitchensink` mutation runs to find gaps in test logic | ✅ Available |
 | **Fuzzing**        | Harness support for `libfuzzer-sys`                                    | 🚧 Optional  |
 
 ## Installation
@@ -25,3 +26,23 @@ Add to your `Cargo.toml`:
 [dev-dependencies]
 kitchensink-testing = "0.2"
 ```
+
+Install the CLI binary:
+
+```bash
+cargo install --locked --path . --force --bin cargo-kitchensink
+
+# Install mutation engine dependency for `cargo kitchensink mutate` workflows:
+cargo install cargo-mutants
+```
+
+Run mutation workflows with either:
+
+```bash
+cargo kitchensink mutate run --project .
+cargo-kitchensink mutate run --project .
+```
+
+The direct `cargo-kitchensink ...` form is equivalent; use whichever works in your environment.
+
+`mutate run` now auto-resumes the latest incomplete run for the same `--project`/`--run-root` before starting a fresh run. Use `mutate resume <run-id>` to continue a specific run explicitly.

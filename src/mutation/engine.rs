@@ -5,13 +5,13 @@ use std::process::Command;
 use thiserror::Error;
 
 use super::config::MutationConfig;
-use super::events::{MutantSpec, MutationOutcome};
+use super::events::{parse_mutation_type, MutantSpec, MutationOutcome};
 
 /// Engine-level errors.
 #[derive(Debug, Error)]
 pub enum MutationEngineError {
     /// `cargo-mutants` binary is unavailable.
-    #[error("cargo-mutants is not installed or not available as `cargo mutants`")]
+    #[error("cargo-mutants is not installed or not available as `cargo mutants`. Install with `cargo install cargo-mutants`.")]
     MissingCargoMutants,
     /// Underlying command execution failed.
     #[error("command execution failed: {0}")]
@@ -58,6 +58,14 @@ pub trait MutationEngine {
 pub struct CargoMutantsEngine;
 
 impl CargoMutantsEngine {
+    fn command_output_missing_command(output: &[u8]) -> bool {
+        let text = String::from_utf8_lossy(output);
+        text.contains("no such command: `mutants`")
+            || text.contains("No such command: `mutants`")
+            || text.contains("unrecognized subcommand 'mutants'")
+            || text.contains("unknown subcommand 'mutants'")
+    }
+
     fn has_mutant_selector_flag(&self) -> Result<bool, MutationEngineError> {
         let out = Command::new("cargo").arg("mutants").arg("--help").output();
 
@@ -68,6 +76,10 @@ impl CargoMutantsEngine {
             }
             Err(err) => return Err(MutationEngineError::Io(err)),
         };
+
+        if !out.status.success() && Self::command_output_missing_command(&out.stderr) {
+            return Err(MutationEngineError::MissingCargoMutants);
+        }
 
         let text = String::from_utf8_lossy(&out.stdout).to_string()
             + &String::from_utf8_lossy(&out.stderr);
@@ -90,6 +102,14 @@ impl CargoMutantsEngine {
     fn classify_outcome(status: std::process::ExitStatus, text: &str) -> MutationOutcome {
         let lower = text.to_ascii_lowercase();
 
+        if lower.contains("found 0 mutants to test")
+            || lower.contains("no mutants found under the active filters")
+        {
+            return MutationOutcome::Error {
+                message: text.trim().to_string(),
+            };
+        }
+
         if lower.contains("timeout") {
             return MutationOutcome::Timeout;
         }
@@ -110,6 +130,43 @@ impl CargoMutantsEngine {
                 message: text.trim().to_string(),
             }
         }
+    }
+
+    fn parse_label(label: &str) -> (String, u32, String) {
+        // cargo-mutants label format: "src/lib.rs:42:5: replace + with *"
+        let parts: Vec<&str> = label.splitn(4, ':').collect();
+        if parts.len() >= 4 {
+            let file = parts[0].to_string();
+            let line = parts[1].parse().unwrap_or(0);
+            let desc = parts[3].trim().to_string();
+            (file, line, desc)
+        } else if parts.len() >= 2 {
+            let file = parts[0].to_string();
+            let line = parts[1].parse().unwrap_or(0);
+            (file, line, label.to_string())
+        } else {
+            (String::new(), 0, label.to_string())
+        }
+    }
+
+    fn escape_regex_literal(input: &str) -> String {
+        let mut output = String::with_capacity(input.len());
+        for ch in input.chars() {
+            match ch {
+                '.' | '+' | '*' | '?' | '^' | '$' | '(' | ')' | '[' | ']' | '{' | '}' | '|'
+                | '\\' => {
+                    output.push('\\');
+                    output.push(ch);
+                }
+                _ => output.push(ch),
+            }
+        }
+        output
+    }
+
+    fn build_label_selector(label: &str) -> String {
+        let escaped = Self::escape_regex_literal(label);
+        format!("^{escaped}$")
     }
 }
 
@@ -134,6 +191,9 @@ impl MutationEngine for CargoMutantsEngine {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            if Self::command_output_missing_command(&output.stderr) {
+                return Err(MutationEngineError::MissingCargoMutants);
+            }
             return Err(MutationEngineError::CommandFailed(stderr));
         }
 
@@ -150,10 +210,18 @@ impl MutationEngine for CargoMutantsEngine {
             }
 
             let id = format!("m{:04x}", Self::stable_hash(&format!("{idx}:{line}")));
+            let (source_file, source_line, mutation_desc) = Self::parse_label(line);
+            let mutation_type = parse_mutation_type(line);
+
             mutants.push(MutantSpec {
                 id,
                 label: line.to_string(),
                 selector: line.to_string(),
+                source_file,
+                source_line,
+                mutation_type,
+                original_code: String::new(),
+                mutated_code: mutation_desc,
             });
         }
 
@@ -171,23 +239,26 @@ impl MutationEngine for CargoMutantsEngine {
         config: &MutationConfig,
         mutant: &MutantSpec,
     ) -> Result<MutantExecutionResult, MutationEngineError> {
-        if !self.has_mutant_selector_flag()? {
-            return Err(MutationEngineError::Unsupported(
-                "this cargo-mutants version does not expose --mutant selector; resumable per-mutant execution is unavailable".to_string(),
-            ));
-        }
+        let supports_mutant_selector = self.has_mutant_selector_flag()?;
 
         let mut cmd = Command::new("cargo");
-        cmd.arg("mutants")
-            .arg("--mutant")
-            .arg(&mutant.selector)
-            .current_dir(&config.project_dir);
+        cmd.arg("mutants").arg("--in-place").arg("--no-times");
+
+        if supports_mutant_selector {
+            cmd.arg("--mutant").arg(&mutant.selector);
+        } else {
+            cmd.arg("--re").arg(Self::build_label_selector(&mutant.selector));
+        }
+        cmd.current_dir(&config.project_dir);
 
         if let Some(timeout_secs) = config.timeout_secs {
-            cmd.env("CARGO_MUTANTS_TIMEOUT", timeout_secs.to_string());
+            cmd.arg("--timeout").arg(timeout_secs.to_string());
         }
 
         let output = cmd.output()?;
+        if !output.status.success() && Self::command_output_missing_command(&output.stderr) {
+            return Err(MutationEngineError::MissingCargoMutants);
+        }
         let text = String::from_utf8_lossy(&output.stdout).to_string()
             + &String::from_utf8_lossy(&output.stderr);
         Ok(MutantExecutionResult {
@@ -243,6 +314,27 @@ mod tests {
             CargoMutantsEngine::classify_outcome(ok_status, "unviable mutation"),
             MutationOutcome::Unviable
         );
+        match CargoMutantsEngine::classify_outcome(ok_status, "Found 0 mutants to test") {
+            MutationOutcome::Error { message } => {
+                assert!(message.contains("Found 0 mutants to test"))
+            }
+            other => panic!("expected error outcome, got {other:?}"),
+        }
+
+        match CargoMutantsEngine::classify_outcome(
+            ok_status,
+            "WARN No mutants found under the active filters",
+        ) {
+            MutationOutcome::Error { message } => {
+                assert!(message.contains("No mutants found under the active filters"))
+            }
+            other => panic!("expected error outcome, got {other:?}"),
+        }
+
+        assert_eq!(
+            CargoMutantsEngine::build_label_selector("src/scenario.rs:139:41: replace > with >="),
+            r"^src/scenario\.rs:139:41: replace > with >=$"
+        );
 
         match CargoMutantsEngine::classify_outcome(fail_status, "unknown failure") {
             MutationOutcome::Error { message } => assert!(message.contains("unknown failure")),
@@ -252,12 +344,19 @@ mod tests {
 
     #[test]
     fn execute_mutant_reports_capability_issue_or_missing_binary() {
+        use crate::mutation::events::MutationType;
+
         let engine = CargoMutantsEngine;
         let config = MutationConfig::default();
         let mutant = MutantSpec {
             id: "m1".to_string(),
             label: "l1".to_string(),
             selector: "s1".to_string(),
+            source_file: String::new(),
+            source_line: 0,
+            mutation_type: MutationType::Unknown,
+            original_code: String::new(),
+            mutated_code: String::new(),
         };
 
         let result = engine.execute_mutant(&config, &mutant);

@@ -4,11 +4,11 @@ This release is intentionally API-breaking.
 
 ## Module Renames
 
-- `rust_pbt::numeric` -> `rust_pbt::generators::numeric` and `rust_pbt::law::invariants`
-- `rust_pbt::collections` -> `rust_pbt::generators::collections`
-- `rust_pbt::arithmetic` -> `rust_pbt::law::algebraic`
-- `rust_pbt::stateful` -> `rust_pbt::law::stateful`
-- `rust_pbt::serialization` -> `rust_pbt::law::serialization`
+- `kitchensink_testing::numeric` -> `kitchensink_testing::generators::numeric` and `kitchensink_testing::law::invariants`
+- `kitchensink_testing::collections` -> `kitchensink_testing::generators::collections`
+- `kitchensink_testing::arithmetic` -> `kitchensink_testing::law::algebraic`
+- `kitchensink_testing::stateful` -> `kitchensink_testing::law::stateful`
+- `kitchensink_testing::serialization` -> `kitchensink_testing::law::serialization`
 
 ## Domain Modules Removed From Core
 
@@ -21,7 +21,7 @@ If you previously used domain helpers (`financial`, `trading`, `options`), defin
 
 ## Prelude Changes
 
-`rust_pbt::prelude::*` now exports a curated subset from:
+`kitchensink_testing::prelude::*` now exports a curated subset from:
 
 - `generators`
 - `law`
@@ -31,7 +31,7 @@ If you previously used domain helpers (`financial`, `trading`, `options`), defin
 
 New workflow uses resumable run state:
 
-- `cargo pbt mutate run`
-- `cargo pbt mutate resume <run-id>`
-- `cargo pbt mutate status <run-id>`
-- `cargo pbt mutate report <run-id>`
+- `cargo kitchensink mutate run` (auto-resumes latest interrupted run for the same project)
+- `cargo kitchensink mutate resume <run-id>`
+- `cargo kitchensink mutate status <run-id>`
+- `cargo kitchensink mutate report <run-id>`
