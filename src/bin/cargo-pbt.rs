@@ -8,7 +8,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use rust_pbt::mutation::state::MutantState;
 use rust_pbt::mutation::{
     CargoMutantsEngine, MutationConfig, MutationStatus, ReportFormat, RunSummary, load_run_status,
-    render_report, resume_run, run_new,
+    render_report, rerun_survivors, resume_run, run_new,
 };
 
 #[derive(Debug, Parser)]
@@ -47,6 +47,20 @@ enum MutateCommand {
     },
     /// Resume an existing run id.
     Resume {
+        /// Existing run id.
+        run_id: String,
+        /// Project directory.
+        #[arg(long)]
+        project: Option<PathBuf>,
+        /// Run root directory.
+        #[arg(long)]
+        run_root: Option<PathBuf>,
+        /// Optional timeout hint in seconds.
+        #[arg(long)]
+        timeout_secs: Option<u64>,
+    },
+    /// Re-run only survivor mutants from an existing run id.
+    Survivors {
         /// Existing run id.
         run_id: String,
         /// Project directory.
@@ -232,6 +246,22 @@ fn main() -> Result<()> {
                 let run = resume_run(&config, &run_id, &engine)?;
                 let summary = RunSummary::from_snapshot(&run.snapshot);
                 println!("run id: {}", run.run_id);
+                println!(
+                    "summary: killed={}, survived={}, incomplete={}, mutation_score={:.2}%",
+                    summary.killed, summary.survived, summary.incomplete, summary.mutation_score
+                );
+            }
+            MutateCommand::Survivors {
+                run_id,
+                project,
+                run_root,
+                timeout_secs,
+            } => {
+                let config = make_config(project, run_root, None, timeout_secs);
+                let run = rerun_survivors(&config, &run_id, &engine)?;
+                let summary = RunSummary::from_snapshot(&run.snapshot);
+                println!("run id: {}", run.run_id);
+                println!("run dir: {}", run.run_dir.display());
                 println!(
                     "summary: killed={}, survived={}, incomplete={}, mutation_score={:.2}%",
                     summary.killed, summary.survived, summary.incomplete, summary.mutation_score

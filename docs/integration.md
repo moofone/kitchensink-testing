@@ -137,8 +137,12 @@ Run:
 # Ensure mutation engine dependency is installed:
 # cargo install cargo-mutants
 
-# Re-running this command resumes the latest incomplete run for the same project.
+# Re-running this command resumes the latest incomplete run.
+# If the latest compatible run is completed but has survivors, it re-tests survivors first.
 cargo kitchensink mutate run --project .
+
+# Run only survivors for a known run id.
+cargo kitchensink mutate survivors <run-id> --project .
 ```
 
 Analyze the report for "survived" mutants.
