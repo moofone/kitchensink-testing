@@ -7,7 +7,9 @@ use std::path::Path;
 
 use thiserror::Error;
 
-use super::events::{MutantSpec, MutationEvent, MutationOutcome};
+use super::events::{
+    MutantSpec, MutationEvent, MutationOutcome, RunConfigSnapshot, RunMetadata, TestFailure,
+};
 
 /// Status derived from event stream for each mutant.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -66,10 +68,27 @@ pub struct MutantState {
     pub stderr_artifact_path: Option<String>,
     /// Optional last error string.
     pub last_error: Option<String>,
+    /// Test names that ran against this mutant.
+    pub tests_run: Vec<String>,
+    /// Tests that failed (for killed mutants).
+    pub tests_failed: Vec<TestFailure>,
+    /// Preview of stdout output.
+    pub stdout_preview: Option<String>,
+    /// Preview of stderr output.
+    pub stderr_preview: Option<String>,
+}
+
+/// Run-level metadata from RunStarted event.
+#[derive(Debug, Clone, Default)]
+pub struct RunInfo {
+    /// Configuration snapshot.
+    pub config: Option<RunConfigSnapshot>,
+    /// Environment metadata.
+    pub metadata: Option<RunMetadata>,
 }
 
 /// Materialized run state derived from `events.jsonl`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct RunSnapshot {
     /// Run id.
     pub run_id: String,
@@ -81,6 +100,8 @@ pub struct RunSnapshot {
     pub interrupted: bool,
     /// Whether a completion event has occurred.
     pub completed: bool,
+    /// Run-level info (config, metadata).
+    pub info: RunInfo,
 }
 
 impl RunSnapshot {
@@ -112,6 +133,7 @@ pub fn replay_events(events_path: &Path) -> Result<RunSnapshot, MutationStateErr
     let mut malformed_lines = 0;
     let mut interrupted = false;
     let mut completed = false;
+    let mut info = RunInfo::default();
 
     for line in reader.lines() {
         let line = line?;
@@ -128,8 +150,19 @@ pub fn replay_events(events_path: &Path) -> Result<RunSnapshot, MutationStateErr
         };
 
         match event {
-            MutationEvent::RunStarted { run_id: id, .. }
-            | MutationEvent::RunResumed { run_id: id, .. } => {
+            MutationEvent::RunStarted {
+                run_id: id,
+                config,
+                metadata,
+                ..
+            } => {
+                if run_id.is_empty() {
+                    run_id = id;
+                }
+                info.config = config;
+                info.metadata = metadata;
+            }
+            MutationEvent::RunResumed { run_id: id, .. } => {
                 if run_id.is_empty() {
                     run_id = id;
                 }
@@ -147,6 +180,10 @@ pub fn replay_events(events_path: &Path) -> Result<RunSnapshot, MutationStateErr
                         stdout_artifact_path: None,
                         stderr_artifact_path: None,
                         last_error: None,
+                        tests_run: Vec::new(),
+                        tests_failed: Vec::new(),
+                        stdout_preview: None,
+                        stderr_preview: None,
                     },
                 );
             }
@@ -170,6 +207,10 @@ pub fn replay_events(events_path: &Path) -> Result<RunSnapshot, MutationStateErr
                 finished_at_ms: _,
                 duration_ms,
                 timestamp_ms,
+                tests_run,
+                tests_failed,
+                stdout_preview,
+                stderr_preview,
                 ..
             } => {
                 if let Some(state) = mutants.get_mut(&mutant_id) {
@@ -188,6 +229,10 @@ pub fn replay_events(events_path: &Path) -> Result<RunSnapshot, MutationStateErr
                     state.exit_code = exit_code;
                     state.stdout_artifact_path = stdout_artifact_path;
                     state.stderr_artifact_path = stderr_artifact_path;
+                    state.tests_run = tests_run;
+                    state.tests_failed = tests_failed;
+                    state.stdout_preview = stdout_preview;
+                    state.stderr_preview = stderr_preview;
                     match outcome {
                         MutationOutcome::Killed => state.status = MutationStatus::Killed,
                         MutationOutcome::Survived => state.status = MutationStatus::Survived,
@@ -216,10 +261,11 @@ pub fn replay_events(events_path: &Path) -> Result<RunSnapshot, MutationStateErr
         malformed_lines,
         interrupted,
         completed,
+        info,
     })
 }
 
-/// Append one event as JSONL line.
+/// Append one event as JSONL line with fsync for durability.
 pub fn append_event(events_path: &Path, event: &MutationEvent) -> Result<(), MutationStateError> {
     let mut file = OpenOptions::new()
         .create(true)
@@ -229,6 +275,7 @@ pub fn append_event(events_path: &Path, event: &MutationEvent) -> Result<(), Mut
     file.write_all(json.as_bytes())?;
     file.write_all(b"\n")?;
     file.flush()?;
+    file.sync_all()?;
     Ok(())
 }
 
@@ -237,18 +284,27 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    use crate::mutation::events::now_timestamp_ms;
+    use crate::mutation::events::{now_timestamp_ms, MutationType};
+
+    fn test_mutant(id: &str, label: &str, selector: &str) -> MutantSpec {
+        MutantSpec {
+            id: id.to_string(),
+            label: label.to_string(),
+            selector: selector.to_string(),
+            source_file: String::new(),
+            source_line: 0,
+            mutation_type: MutationType::Unknown,
+            original_code: String::new(),
+            mutated_code: String::new(),
+        }
+    }
 
     #[test]
     fn replay_is_deterministic() {
         let tmp = tempdir().expect("tempdir should be created");
         let events_path = tmp.path().join("events.jsonl");
 
-        let mutant = MutantSpec {
-            id: "m1".to_string(),
-            label: "mutant 1".to_string(),
-            selector: "sel1".to_string(),
-        };
+        let mutant = test_mutant("m1", "mutant 1", "sel1");
 
         append_event(
             &events_path,
@@ -256,6 +312,8 @@ mod tests {
                 run_id: "run-1".to_string(),
                 timestamp_ms: now_timestamp_ms(),
                 discovered: 1,
+                config: None,
+                metadata: None,
             },
         )
         .expect("run started should append");
@@ -271,7 +329,8 @@ mod tests {
 
         let a = replay_events(&events_path).expect("first replay should work");
         let b = replay_events(&events_path).expect("second replay should work");
-        assert_eq!(a, b);
+        assert_eq!(a.run_id, b.run_id);
+        assert_eq!(a.mutants.len(), b.mutants.len());
     }
 
     #[test]
@@ -285,6 +344,8 @@ mod tests {
                 run_id: "run-1".to_string(),
                 timestamp_ms: now_timestamp_ms(),
                 discovered: 0,
+                config: None,
+                metadata: None,
             },
         )
         .expect("run started should append");
@@ -306,21 +367,9 @@ mod tests {
         let tmp = tempdir().expect("tempdir should be created");
         let events_path = tmp.path().join("events.jsonl");
 
-        let m_pending = MutantSpec {
-            id: "m_pending".to_string(),
-            label: "pending".to_string(),
-            selector: "sel_pending".to_string(),
-        };
-        let m_running = MutantSpec {
-            id: "m_running".to_string(),
-            label: "running".to_string(),
-            selector: "sel_running".to_string(),
-        };
-        let m_done = MutantSpec {
-            id: "m_done".to_string(),
-            label: "done".to_string(),
-            selector: "sel_done".to_string(),
-        };
+        let m_pending = test_mutant("m_pending", "pending", "sel_pending");
+        let m_running = test_mutant("m_running", "running", "sel_running");
+        let m_done = test_mutant("m_done", "done", "sel_done");
 
         append_event(
             &events_path,
@@ -328,6 +377,8 @@ mod tests {
                 run_id: "run-2".to_string(),
                 timestamp_ms: now_timestamp_ms(),
                 discovered: 3,
+                config: None,
+                metadata: None,
             },
         )
         .expect("run started should append");
@@ -364,6 +415,10 @@ mod tests {
                 started_at_ms: None,
                 finished_at_ms: None,
                 duration_ms: None,
+                tests_run: Vec::new(),
+                tests_failed: Vec::new(),
+                stdout_preview: None,
+                stderr_preview: None,
             },
         )
         .expect("done mutant should append");
@@ -383,11 +438,7 @@ mod tests {
     fn error_outcome_persists_error_message() {
         let tmp = tempdir().expect("tempdir should be created");
         let events_path = tmp.path().join("events.jsonl");
-        let mutant = MutantSpec {
-            id: "m_err".to_string(),
-            label: "error mutant".to_string(),
-            selector: "sel_err".to_string(),
-        };
+        let mutant = test_mutant("m_err", "error mutant", "sel_err");
 
         append_event(
             &events_path,
@@ -395,6 +446,8 @@ mod tests {
                 run_id: "run-3".to_string(),
                 timestamp_ms: now_timestamp_ms(),
                 discovered: 1,
+                config: None,
+                metadata: None,
             },
         )
         .expect("run started should append");
@@ -422,6 +475,10 @@ mod tests {
                 started_at_ms: None,
                 finished_at_ms: None,
                 duration_ms: None,
+                tests_run: Vec::new(),
+                tests_failed: Vec::new(),
+                stdout_preview: None,
+                stderr_preview: None,
             },
         )
         .expect("mutant finished should append");

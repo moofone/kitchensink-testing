@@ -17,7 +17,7 @@ You have access to `kitchensink_testing::prelude::*`.
 
 | Category | Function / Macro | Usage Constraint |
 | --- | --- | --- |
-| Generators | `finite_f64(min, max)`, `bounded_f64`, `non_negative_f64` | Use for all math inputs. Avoid raw `f64::ANY`. |
+| Generators | `finite_f64(min, max)`, `bounded_f64`, `non_negative_f64`, `positive_f64` | Use for all math inputs. Avoid raw `f64::ANY`. |
 | Generators | `vec_of(strategy, size)`, `unique_vec` | Use for batch operations. |
 | Generators | `monotonic_timestamps`, `tick_aligned` | Use for time-series data. |
 | Generators | `alphanumeric_id`, `prefixed_id` | Use for identifiers/keys. |
@@ -25,8 +25,16 @@ You have access to `kitchensink_testing::prelude::*`.
 | Invariants | `assert_approx_eq(a, b, epsilon)` | Use for floating point comparisons. |
 | Invariants | `assert_monotonic_increasing(func, input)` | Use for pricing/scoring logic. |
 | Invariants | `assert_all_in_range(val, min, max)` | Use for validation logic. |
+| Stateful | `assert_idempotent(func, input)` | Use on normalization-like or stable transformations. |
+| Stateful | `assert_involutive(func, input)` | Use for reversible/symmetric transforms. |
+| Stateful | `assert_state_invariant(state, predicate)` | Use for state validity checks before/after operations. |
+| Stateful | `assert_valid_state_transition(initial, event, final, predicate)` | Use for transition-level checks. |
+| Stateful | `assert_valid_state_sequence(states, predicate)` | Use for sequence/monotone chain checks. |
 | Laws | `assert_associative`, `assert_commutative` | Use for custom operators (`Add`, `Mul`). |
-| Laws | `assert_idempotent(func, input)` | Use for retriable operations (RPCs, state updates). |
+| Chaos | `assert_retries_to_expected_success` | Exercise bounded retry loops and success budget guarantees. |
+| Chaos | `assert_retry_stops_after_permanent_error` | Exercise retry-stop behavior on terminal errors. |
+| Chaos | `assert_retry_fallback` | Exercise fallback path selection and verification behavior. |
+| Chaos | `RetryEventuallySucceedsLaw`, `RetryStopsAfterPermanentErrorLaw`, `RetryFallbackLaw` | Compose law wrappers when tests need explicit law object checks. |
 | Serde | `assert_json_roundtrip`, `assert_json_deterministic` | **MANDATORY** for all `Serialize` structs. |
 | Serde | `assert_bincode_roundtrip` | Use if binary format is required. |
 
@@ -126,7 +134,11 @@ If requested to "audit tests":
 Run:
 
 ```bash
-cargo pbt mutate run --project .
+# Ensure mutation engine dependency is installed:
+# cargo install cargo-mutants
+
+# Re-running this command resumes the latest incomplete run for the same project.
+cargo kitchensink mutate run --project .
 ```
 
 Analyze the report for "survived" mutants.

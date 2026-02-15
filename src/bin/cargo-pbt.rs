@@ -1,7 +1,6 @@
-#![cfg(feature = "mutation")]
-
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::env;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
@@ -13,7 +12,7 @@ use rust_pbt::mutation::{
 };
 
 #[derive(Debug, Parser)]
-#[command(name = "cargo-pbt")]
+#[command(name = "cargo-kitchensink")]
 #[command(about = "Mutation orchestration for kitchensink-testing")]
 struct Cli {
     #[command(subcommand)]
@@ -31,7 +30,7 @@ enum TopCommand {
 
 #[derive(Debug, Subcommand)]
 enum MutateCommand {
-    /// Start a new mutation run.
+    /// Start a mutation run. If an incomplete interrupted run exists, it resumes automatically.
     Run {
         /// Project directory.
         #[arg(long)]
@@ -193,7 +192,16 @@ fn inspect_payload(run_id: &str, state: &MutantState, run_dir: &Path) -> serde_j
 }
 
 fn main() -> Result<()> {
-    let cli = Cli::parse();
+    let mut args: Vec<String> = env::args().collect();
+    while args.len() >= 2 {
+        match args[1].as_str() {
+            "kitchensink" | "kitchensink-testing" | "pbt" => {
+                args.remove(1);
+            }
+            _ => break,
+        }
+    }
+    let cli = Cli::parse_from(args);
     let engine = CargoMutantsEngine;
 
     match cli.command {

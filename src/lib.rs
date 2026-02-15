@@ -13,6 +13,7 @@
 
 pub mod generators;
 pub mod law;
+pub mod chaos;
 pub mod prelude;
 
 #[cfg(feature = "mutation")]
