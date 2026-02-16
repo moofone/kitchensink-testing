@@ -23,6 +23,31 @@ pub use crate::law::stateful::{
     assert_idempotent, assert_involutive, assert_state_invariant, assert_valid_state_sequence,
     assert_valid_state_transition,
 };
+#[cfg(feature = "tokio-laws")]
+pub use crate::law::tokio::io::{
+    PartialIoObservation, PartialIoProbe, TransientIoRetryObservation, TransientIoRetryProbe,
+    assert_handles_partial_io, assert_retries_transient_io_errors,
+};
+#[cfg(feature = "tokio-loom")]
+pub use crate::law::tokio::loom::{TokioLoomModel, assert_loom_model};
+#[cfg(feature = "tokio-laws")]
+pub use crate::law::tokio::sync::{
+    ChannelBackpressureObservation, ChannelBackpressureProbe, ChannelIntegrityObservation,
+    ChannelIntegrityProbe, PermitAccountingObservation, PermitLeakProbe,
+    assert_channel_backpressure, assert_channel_no_drop_or_duplicate, assert_no_permit_leak,
+};
+#[cfg(feature = "tokio-laws")]
+pub use crate::law::tokio::task::{
+    CancellationSafetyObservation, CancellationSafetyProbe, GracefulShutdownObservation,
+    GracefulShutdownProbe, TaskLeakObservation, TaskLeakProbe, assert_cancellation_safe,
+    assert_graceful_shutdown, assert_no_task_leak,
+};
+#[cfg(feature = "tokio-laws")]
+pub use crate::law::tokio::time::{
+    BackoffObservation, BackoffProbe, IntervalDriftObservation, IntervalDriftProbe,
+    TimeoutBehaviorProbe, TimeoutObservation, assert_backoff_bounds, assert_interval_no_drift,
+    assert_timeout_behavior,
+};
 
 #[cfg(feature = "serialization")]
 pub use crate::law::serialization::{assert_bincode_deterministic, assert_bincode_roundtrip};
