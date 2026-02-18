@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 
-use rust_pbt::mutation::state::MutantState;
-use rust_pbt::mutation::{
+use kitchensink_testing::mutation::state::MutantState;
+use kitchensink_testing::mutation::{
     CargoMutantsEngine, MutationConfig, MutationStatus, ReportFormat, RunSummary, load_run_status,
     render_report, rerun_survivors, resume_run, run_new,
 };
@@ -269,7 +269,7 @@ fn main() -> Result<()> {
             }
             MutateCommand::Status { run_id, run_root } => {
                 let config = make_config(None, run_root, None, None);
-                let snapshot = rust_pbt::mutation::load_run_status(&config, &run_id)?;
+                let snapshot = kitchensink_testing::mutation::load_run_status(&config, &run_id)?;
                 let summary = RunSummary::from_snapshot(&snapshot);
                 println!("run id: {}", snapshot.run_id);
                 println!("completed: {}", snapshot.completed);
@@ -289,7 +289,7 @@ fn main() -> Result<()> {
                     OutputFormat::Md => ReportFormat::Markdown,
                     OutputFormat::Json => ReportFormat::Json,
                 };
-                let snapshot = rust_pbt::mutation::load_run_status(&config, &run_id)?;
+                let snapshot = kitchensink_testing::mutation::load_run_status(&config, &run_id)?;
                 println!("{}", render_report(&snapshot, format));
             }
             MutateCommand::List {

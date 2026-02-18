@@ -153,8 +153,8 @@ fn e2e_cli_mutation_run_interrupt_resume_report() {
     }
 
     let run_id = run_id_from_output(&run_output.stdout);
-    let config = rust_pbt::mutation::MutationConfig::default().with_run_root(&run_root);
-    let snapshot = rust_pbt::mutation::load_run_status(&config, &run_id)
+    let config = kitchensink_testing::mutation::MutationConfig::default().with_run_root(&run_root);
+    let snapshot = kitchensink_testing::mutation::load_run_status(&config, &run_id)
         .expect("status should load after interrupt");
     assert!(snapshot.interrupted);
     assert!(!snapshot.completed);
@@ -181,7 +181,7 @@ fn e2e_cli_mutation_run_interrupt_resume_report() {
     );
 
     assert!(resume_output.status.success());
-    let resumed = rust_pbt::mutation::load_run_status(&config, &run_id)
+    let resumed = kitchensink_testing::mutation::load_run_status(&config, &run_id)
         .expect("status should load after resume");
     assert!(resumed.completed);
     assert_eq!(resumed.pending_mutants().len(), 0);
