@@ -6,14 +6,14 @@ rust-version = "1.85"
 authors = ["moofone22@gmail.com"]
 license = "MIT OR Apache-2.0"
 description = "Kitchen-sink testing framework with reusable generators, laws, mutation orchestration, and serialization helpers"
-repository = "https://github.com/moofone/rust-pbt"
+repository = "https://github.com/moofone/kitchensink-testing"
 documentation = "https://docs.rs/kitchensink-testing"
 readme = "README.md"
 keywords = ["testing", "property-based", "proptest", "mutation-testing", "kitchen-sink", "framework"]
 categories = ["development-tools::testing", "development-tools"]
 
 [lib]
-name = "rust_pbt"
+name = "kitchensink_testing"
 
 [[bin]]
 name = "cargo-pbt"

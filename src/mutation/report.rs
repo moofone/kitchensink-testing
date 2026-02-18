@@ -350,7 +350,7 @@ fn render_sarif_report(
                 "driver": {
                     "name": "kitchensink-testing",
                     "version": env!("CARGO_PKG_VERSION"),
-                    "informationUri": "https://github.com/moofone/rust-pbt",
+                    "informationUri": "https://github.com/moofone/kitchensink-testing",
                     "rules": [{
                         "id": "survived-mutant",
                         "shortDescription": {

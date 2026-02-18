@@ -3,7 +3,7 @@
 use std::future::Future;
 use std::time::Duration;
 
-use rust_pbt::prelude::*;
+use kitchensink_testing::prelude::*;
 
 struct Probe;
 

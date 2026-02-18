@@ -1,4 +1,4 @@
-use rust_pbt::prelude::*;
+use kitchensink_testing::prelude::*;
 
 #[test]
 fn prelude_compiles_and_exports_core() {
