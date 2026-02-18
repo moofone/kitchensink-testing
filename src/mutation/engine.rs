@@ -5,13 +5,15 @@ use std::process::Command;
 use thiserror::Error;
 
 use super::config::MutationConfig;
-use super::events::{parse_mutation_type, MutantSpec, MutationOutcome};
+use super::events::{MutantSpec, MutationOutcome, parse_mutation_type};
 
 /// Engine-level errors.
 #[derive(Debug, Error)]
 pub enum MutationEngineError {
     /// `cargo-mutants` binary is unavailable.
-    #[error("cargo-mutants is not installed or not available as `cargo mutants`. Install with `cargo install cargo-mutants`.")]
+    #[error(
+        "cargo-mutants is not installed or not available as `cargo mutants`. Install with `cargo install cargo-mutants`."
+    )]
     MissingCargoMutants,
     /// Underlying command execution failed.
     #[error("command execution failed: {0}")]
@@ -247,7 +249,8 @@ impl MutationEngine for CargoMutantsEngine {
         if supports_mutant_selector {
             cmd.arg("--mutant").arg(&mutant.selector);
         } else {
-            cmd.arg("--re").arg(Self::build_label_selector(&mutant.selector));
+            cmd.arg("--re")
+                .arg(Self::build_label_selector(&mutant.selector));
         }
         cmd.current_dir(&config.project_dir);
 

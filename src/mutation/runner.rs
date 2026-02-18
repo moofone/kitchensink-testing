@@ -2,17 +2,17 @@
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
 use thiserror::Error;
 
 use super::config::MutationConfig;
 use super::engine::{MutantExecutionResult, MutationEngine, MutationEngineError};
-use super::events::{now_timestamp_ms, MutantSpec, MutationEvent, MutationOutcome};
-use super::report::{render_report, ReportFormat};
-use super::state::{append_event, replay_events, MutationStateError, RunSnapshot};
+use super::events::{MutantSpec, MutationEvent, MutationOutcome, now_timestamp_ms};
+use super::report::{ReportFormat, render_report};
+use super::state::{MutationStateError, RunSnapshot, append_event, replay_events};
 
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 static RUN_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -338,7 +338,11 @@ pub fn run_new(
             m.id.contains(filter) || m.label.contains(filter) || m.selector.contains(filter)
         });
     }
-    println!("kitchensink-testing: discovered {} mutant(s) in {}", mutants.len(), config.project_dir.display());
+    println!(
+        "kitchensink-testing: discovered {} mutant(s) in {}",
+        mutants.len(),
+        config.project_dir.display()
+    );
 
     append_event(
         &events,
@@ -370,7 +374,10 @@ pub fn run_new(
 
     for (index, mutant) in mutants.iter().enumerate() {
         let position = index + 1;
-        println!("kitchensink-testing: running mutant {position}/{total_mutants}: {}", mutant.label);
+        println!(
+            "kitchensink-testing: running mutant {position}/{total_mutants}: {}",
+            mutant.label
+        );
         if INTERRUPTED.load(Ordering::SeqCst) {
             append_event(
                 &events,
@@ -467,7 +474,10 @@ pub fn resume_run(
     let total_mutants = scheduled.len();
     for (index, mutant) in scheduled.iter().enumerate() {
         let position = index + 1;
-        println!("kitchensink-testing: running mutant {position}/{total_mutants}: {}", mutant.label);
+        println!(
+            "kitchensink-testing: running mutant {position}/{total_mutants}: {}",
+            mutant.label
+        );
         if INTERRUPTED.load(Ordering::SeqCst) {
             append_event(
                 &events,
@@ -1165,7 +1175,8 @@ mod tests {
             order: order.clone(),
         };
 
-        let rerun = rerun_survivors(&config, run_id, &engine).expect("survivor rerun should succeed");
+        let rerun =
+            rerun_survivors(&config, run_id, &engine).expect("survivor rerun should succeed");
         let execution_order = order
             .lock()
             .expect("recording order mutex should lock")
@@ -1190,10 +1201,12 @@ mod tests {
             .get("m_err")
             .expect("error mutant should be tracked");
         assert_eq!(state.status, crate::mutation::state::MutationStatus::Error);
-        assert!(state
-            .last_error
-            .as_ref()
-            .is_some_and(|m| m.contains("forced error")));
+        assert!(
+            state
+                .last_error
+                .as_ref()
+                .is_some_and(|m| m.contains("forced error"))
+        );
         assert!(run.snapshot.completed);
     }
 

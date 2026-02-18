@@ -11,9 +11,11 @@ pub mod state;
 pub use config::MutationConfig;
 pub use engine::{CargoMutantsEngine, MutationEngine};
 pub use events::{
-    collect_metadata, parse_mutation_type, truncate_preview, MutantSpec, MutationOutcome,
-    MutationType, RunConfigSnapshot, RunMetadata, TestFailure,
+    MutantSpec, MutationOutcome, MutationType, RunConfigSnapshot, RunMetadata, TestFailure,
+    collect_metadata, parse_mutation_type, truncate_preview,
 };
-pub use report::{render_report, MutantReport, ReportFormat, RunSummary};
-pub use runner::{load_run_status, render_run_report, rerun_survivors, resume_run, run_new, RunResult};
+pub use report::{MutantReport, ReportFormat, RunSummary, render_report};
+pub use runner::{
+    RunResult, load_run_status, render_run_report, rerun_survivors, resume_run, run_new,
+};
 pub use state::{MutationStatus, RunInfo, RunSnapshot};
