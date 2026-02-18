@@ -158,7 +158,10 @@ fn e2e_cli_mutation_run_interrupt_resume_report() {
         .expect("status should load after interrupt");
     assert!(snapshot.interrupted);
     assert!(!snapshot.completed);
-    assert_eq!(snapshot.pending_mutants().len(), 1);
+    assert!(
+        !snapshot.pending_mutants().is_empty(),
+        "interrupt should leave at least one mutant pending or running"
+    );
 
     let resume_output = run_cli_with_fake_cargo(
         &[

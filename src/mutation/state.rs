@@ -293,7 +293,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    use crate::mutation::events::{now_timestamp_ms, MutationType};
+    use crate::mutation::events::{MutationType, now_timestamp_ms};
 
     fn test_mutant(id: &str, label: &str, selector: &str) -> MutantSpec {
         MutantSpec {

@@ -15,6 +15,8 @@ Reusable testing infrastructure for high-assurance Rust. This crate unifies Prop
 | **Stateful Laws**  | Verify state machines (transitions, idempotence, sequence validity)    | ✅ Available |
 | **Serialization**  | Guarantee JSON/Bincode roundtrip stability and determinism             | ✅ Available |
 | **Chaos / Retry**  | Validate transient retry, permanent failures, and fallback behavior      | ✅ Available |
+| **Tokio Laws**     | Trait-driven task/time/sync/io concurrency contracts for Tokio systems   | ✅ Optional  |
+| **Tokio + Loom**   | Exhaustive schedule checking adapter for selected Tokio concurrency kernels | ✅ Optional  |
 | **Mutation**       | Orchestrate `cargo kitchensink` mutation runs to find gaps in test logic | ✅ Available |
 | **Fuzzing**        | Harness support for `libfuzzer-sys`                                    | 🚧 Optional  |
 
@@ -25,6 +27,10 @@ Add to your `Cargo.toml`:
 ```toml
 [dev-dependencies]
 kitchensink-testing = "0.2"
+# Enable Tokio law surface:
+# kitchensink-testing = { version = "0.2", features = ["tokio-laws"] }
+# Enable Loom adapter on top:
+# kitchensink-testing = { version = "0.2", features = ["tokio-laws", "tokio-loom"] }
 ```
 
 Install the CLI binary:

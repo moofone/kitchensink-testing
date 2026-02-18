@@ -136,12 +136,7 @@ where
     }
 
     /// Construct a retry-until-success law wrapper.
-    pub fn new(
-        max_attempts: usize,
-        operation: Op,
-        is_retryable: IsRetryable,
-        expected: T,
-    ) -> Self {
+    pub fn new(max_attempts: usize, operation: Op, is_retryable: IsRetryable, expected: T) -> Self {
         Self {
             max_attempts,
             operation,
@@ -199,7 +194,8 @@ pub struct RetryFallbackLaw<Op, IsRetryable, Fallback, VerifyFallback, T, E> {
     _error_type: PhantomData<E>,
 }
 
-impl<Op, IsRetryable, Fallback, VerifyFallback, T, E> RetryFallbackLaw<Op, IsRetryable, Fallback, VerifyFallback, T, E>
+impl<Op, IsRetryable, Fallback, VerifyFallback, T, E>
+    RetryFallbackLaw<Op, IsRetryable, Fallback, VerifyFallback, T, E>
 where
     Op: Fn() -> Result<T, E>,
     IsRetryable: Fn(&E) -> bool,

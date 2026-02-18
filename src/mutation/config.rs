@@ -66,9 +66,11 @@ mod tests {
     #[test]
     fn default_paths_and_builder_overrides_work() {
         let default = MutationConfig::default();
-        assert!(default
-            .run_root
-            .ends_with(".kitchensink-testing/mutation/runs"));
+        assert!(
+            default
+                .run_root
+                .ends_with(".kitchensink-testing/mutation/runs")
+        );
 
         let cfg = MutationConfig::default()
             .with_project_dir("/tmp/project-a")

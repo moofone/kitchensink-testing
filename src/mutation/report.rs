@@ -458,7 +458,7 @@ mod tests {
 
     use super::*;
     use crate::mutation::events::{MutantSpec, MutationType};
-    use crate::mutation::state::{MutantState, MutationStatus};
+    use crate::mutation::state::{MutantState, MutationStatus, RunInfo};
 
     fn test_mutant(id: &str) -> MutantState {
         MutantState {

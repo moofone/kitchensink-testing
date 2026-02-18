@@ -11,6 +11,15 @@
 kitchensink-testing = { version = "0.2", features = ["serialization", "mutation"] }
 ```
 
+For Tokio-heavy systems, enable the Tokio law surface:
+
+```toml
+[dev-dependencies]
+kitchensink-testing = { version = "0.2", features = ["serialization", "mutation", "tokio-laws"] }
+# Optional exhaustive scheduler checks for selected kernels:
+# kitchensink-testing = { version = "0.2", features = ["serialization", "mutation", "tokio-laws", "tokio-loom"] }
+```
+
 ## 2. API Surface Map (The Toolkit)
 
 You have access to `kitchensink_testing::prelude::*`.
@@ -35,6 +44,11 @@ You have access to `kitchensink_testing::prelude::*`.
 | Chaos | `assert_retry_stops_after_permanent_error` | Exercise retry-stop behavior on terminal errors. |
 | Chaos | `assert_retry_fallback` | Exercise fallback path selection and verification behavior. |
 | Chaos | `RetryEventuallySucceedsLaw`, `RetryStopsAfterPermanentErrorLaw`, `RetryFallbackLaw` | Compose law wrappers when tests need explicit law object checks. |
+| Tokio Task | `assert_cancellation_safe`, `assert_no_task_leak`, `assert_graceful_shutdown` | Implement Tokio probe traits in the app crate and run async law checks. |
+| Tokio Time | `assert_timeout_behavior`, `assert_backoff_bounds`, `assert_interval_no_drift` | Use deterministic Tokio time control to enforce scheduling contracts. |
+| Tokio Sync | `assert_channel_no_drop_or_duplicate`, `assert_channel_backpressure`, `assert_no_permit_leak` | Validate channel and semaphore correctness with app-defined probes. |
+| Tokio I/O | `assert_handles_partial_io`, `assert_retries_transient_io_errors` | Validate partial I/O handling and transient retry behavior. |
+| Tokio Loom | `assert_loom_model` | Optional: execute selected concurrency kernels under Loom schedules. |
 | Serde | `assert_json_roundtrip`, `assert_json_deterministic` | **MANDATORY** for all `Serialize` structs. |
 | Serde | `assert_bincode_roundtrip` | Use if binary format is required. |
 
